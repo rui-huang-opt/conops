@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "conops"
-version = "0.3.0"
+version = "0.4.0"
 description = "A Python package for distributed consensus operations."
 readme = "README.md"
 requires-python = ">=3.10"

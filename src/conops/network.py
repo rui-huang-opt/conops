@@ -848,7 +848,9 @@ class Network:
             NDArray[float64]: The Laplacian vector representing the difference between the current state and the average state of its neighbors.
         """
         neighbor_states = self.exchange(state)
-        laplacian = state * len(neighbor_states) - sum(neighbor_states.values())
+        laplacian = state * len(neighbor_states)
+        for neighbor_state in neighbor_states.values():
+            laplacian -= neighbor_state
 
         return laplacian
 
@@ -872,9 +874,11 @@ class Network:
         """
         neighbor_states = self.exchange(state)
         nbrs = self._neighbors
-        neighbor_mix = sum(neighbor_states[j] * w for j, w in nbrs.items())
+        mix = (1.0 - sum(nbrs.values())) * state
+        for j, neighbor_state in neighbor_states.items():
+            mix += nbrs[j] * neighbor_state
 
-        return (1.0 - sum(nbrs.values())) * state + neighbor_mix
+        return mix
 
     def _run(self) -> None:
         """
