@@ -127,7 +127,7 @@ class FastNetwork:
             try:
                 pyre_node.stop()
             except Exception:
-                logger.exception("Failed to stop Pyre node '%s'.", self._node_id)
+                logger.exception("[%s] Failed to stop Pyre node.", self._node_id)
 
         self._out_socket.close(linger=0)
 
@@ -136,7 +136,7 @@ class FastNetwork:
 
         self._dealers.clear()
 
-        logger.info("Node '%s' closed.", self._node_id)
+        logger.info("[%s] Node closed.", self._node_id)
 
     def _create_sockets(self) -> int:
         self._out_socket = self._context.socket(zmq.ROUTER)
@@ -168,7 +168,7 @@ class FastNetwork:
         pyre_node = self._pyre_node
 
         if pyre_node is None:
-            raise RuntimeError("Pyre is not started")
+            raise RuntimeError(f"[{self._node_id}] Pyre is not started")
 
         endpoints: dict[str, str] = {}
         pending: dict[bytes, tuple[str, int]] = {}
@@ -216,13 +216,6 @@ class FastNetwork:
             endpoint = f"tcp://{host}:{port}"
             endpoints[peer_id] = endpoint
 
-            logger.info(
-                "Neighbor discovered: node='%s', " "neighbor='%s', endpoint='%s'",
-                self._node_id,
-                peer_id,
-                endpoint,
-            )
-
         return endpoints
 
     def _connect_to_neighbors(self, endpoints: dict[str, str]) -> None:
@@ -242,7 +235,7 @@ class FastNetwork:
             if peer_id in self._neighbors:
                 connected.add(peer_id)
 
-        logger.info("Node '%s' connected to all neighbors.", self._node_id)
+        logger.info("[%s] Connected to all %d neighbors.", self._node_id, self.degree)
 
     def neighborwise_exchange(
         self, state_map: dict[str, NDArray[np.float64]]
@@ -264,9 +257,10 @@ class FastNetwork:
         if state_map.keys() != self._neighbors.keys():
             missing = self._neighbors.keys() - state_map.keys()
             extra = state_map.keys() - self._neighbors.keys()
-            err_msg = f"State dictionary keys do not match neighbor names. Missing: {missing}, Extra: {extra}."
-            logger.error(err_msg)
-            raise ValueError(err_msg)
+            raise ValueError(
+                f"[{self._node_id}] State dictionary keys do not match neighbor names. "
+                f"Missing: {missing}, Extra: {extra}."
+            )
 
         for j in self._neighbors:
             state = state_map[j]
