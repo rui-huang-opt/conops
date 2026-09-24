@@ -15,6 +15,42 @@ logger = getLogger(__name__)
 
 
 class FastNetwork:
+    """
+    Lightweight synchronous communication interface for fast state exchange.
+
+    Unlike :class:`Network`, which uses a background communication thread
+    and provides round-aware recovery, replay, and out-of-order message
+    handling, ``FastNetwork`` implements only the synchronous communication
+    path. Pyre is used for neighbor discovery during initialization, while
+    exchanged states are transmitted directly through ZeroMQ ROUTER/DEALER
+    sockets.
+
+    This reduces protocol overhead at the cost of omitting the recovery
+    semantics provided by :class:`Network`. ``FastNetwork`` is therefore
+    intended for synchronized and performance-sensitive experiments where
+    application-level recovery is not required.
+
+    Parameters
+    ----------
+    node_id : str
+        Unique identifier of the local node.
+
+    neighbors : dict[str, float]
+        Mapping from neighbor node IDs to their associated edge weights.
+
+    namespace : str, optional
+        Namespace used to isolate independent network instances.
+        Defaults to ``"default"``.
+
+    transform : Transform | None, optional
+        Transformation applied to exchanged states. If ``None``,
+        :class:`Identity` is used.
+
+    context : zmq.SyncContext | None, optional
+        ZeroMQ context used by the network. If ``None``, the process-wide
+        shared context returned by :meth:`zmq.Context.instance` is used.
+    """
+
     def __init__(
         self,
         node_id: str,
