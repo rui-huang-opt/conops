@@ -76,6 +76,7 @@ class FastNetwork:
 
         self._out_socket = self._context.socket(zmq.ROUTER)
         self._out_socket.setsockopt(zmq.LINGER, 0)
+        port = self._out_socket.bind_to_random_port("tcp://*")
 
         identity = self._node_id.encode("utf-8")
 
@@ -87,21 +88,7 @@ class FastNetwork:
 
             self._dealers[peer_id] = dealer
 
-        self._pyre_node = pyre.Pyre(self._node_id, ctx=self._context)
-
-        try:
-            port = self._out_socket.bind_to_random_port("tcp://*")
-
-            self._pyre_node.set_header("port", str(port))
-            self._pyre_node.join(self._namespace)
-            self._pyre_node.start()
-
-            endpoints = self._discover_neighbors()
-            self._connect_to_neighbors(endpoints)
-
-        except Exception:
-            self.close()
-            raise
+        self._bootstrap(port)
 
     @property
     def node_id(self) -> str:
@@ -120,15 +107,6 @@ class FastNetwork:
         return self._neighbors
 
     def close(self) -> None:
-        pyre_node = self._pyre_node
-        self._pyre_node = None
-
-        if pyre_node is not None:
-            try:
-                pyre_node.stop()
-            except Exception:
-                logger.exception("[%s] Failed to stop Pyre node.", self._node_id)
-
         self._out_socket.close(linger=0)
 
         for dealer in self._dealers.values():
@@ -137,6 +115,31 @@ class FastNetwork:
         self._dealers.clear()
 
         logger.info("[%s] Node closed.", self._node_id)
+
+    def _bootstrap(self, port: int) -> None:
+        """
+        Bootstrap the network using Pyre for discovery, then establish
+        direct ZeroMQ connections to all neighbors.
+        """
+        pyre_node = pyre.Pyre(self._node_id, ctx=self._context)
+
+        try:
+            pyre_node.set_header("port", str(port))
+            pyre_node.join(self._namespace)
+            pyre_node.start()
+
+            endpoints = self._discover_neighbors(pyre_node)
+            self._connect_to_neighbors(endpoints)
+
+        except Exception:
+            self.close()
+            raise
+
+        finally:
+            try:
+                pyre_node.stop()
+            except Exception:
+                logger.exception("[%s] Failed to stop Pyre node.", self._node_id)
 
     def _create_sockets(self) -> int:
         self._out_socket = self._context.socket(zmq.ROUTER)
@@ -155,21 +158,7 @@ class FastNetwork:
 
         return data_port
 
-    def _start_pyre(self, data_port: int) -> None:
-        pyre_node = pyre.Pyre(self._node_id, ctx=self._context)
-
-        self._pyre_node = pyre_node
-
-        pyre_node.set_header("port", str(data_port))
-        pyre_node.join(self._namespace)
-        pyre_node.start()
-
-    def _discover_neighbors(self) -> dict[str, str]:
-        pyre_node = self._pyre_node
-
-        if pyre_node is None:
-            raise RuntimeError(f"[{self._node_id}] Pyre is not started")
-
+    def _discover_neighbors(self, pyre_node: pyre.Pyre) -> dict[str, str]:
         endpoints: dict[str, str] = {}
         pending: dict[bytes, tuple[str, int]] = {}
 
