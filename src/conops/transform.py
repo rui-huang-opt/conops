@@ -81,12 +81,8 @@ class Quantize:
         min_val = np.iinfo(quantized_dtype).min
         max_val = np.iinfo(quantized_dtype).max
 
-        abs_state = np.abs(state)
-        nonzero = abs_state[abs_state > 0]
-        if nonzero.size == 0:
-            scale = 1.0
-        else:
-            scale = float(np.max(nonzero) / max_val)
+        max_abs = float(np.max(np.abs(state)))
+        scale = max_abs / max_val if max_abs > 0 else 1.0
 
         scaled_state = state / scale
         rounded_state = np.round(scaled_state)
