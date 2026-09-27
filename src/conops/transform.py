@@ -68,7 +68,7 @@ class Quantize:
 
     Parameters
     ----------
-    dtype : str, optional
+    quantized_dtype : str
         The target integer data type for quantization. Default is 'int8'.
     """
 
@@ -130,7 +130,7 @@ class DPMechanism:
 
     def encode(self, state: NDArray) -> tuple[bytes, NDArray]:
         noise = npr.laplace(0, self._scale, size=state.shape)
-        noisy_state = state + noise
+        noisy_state = state + noise.astype(state.dtype, copy=False)
         dtype = noisy_state.dtype.str
         meta = BasicMeta(dtype=dtype, shape=noisy_state.shape)
         meta_bytes = msgspec.msgpack.encode(meta)
@@ -161,7 +161,7 @@ class GaussianNoise:
 
     def encode(self, state: NDArray) -> tuple[bytes, NDArray]:
         noise = npr.normal(self.loc, self.scale, state.shape)
-        noisy_state = state + noise
+        noisy_state = state + noise.astype(state.dtype, copy=False)
         dtype = noisy_state.dtype.str
         meta = BasicMeta(dtype=dtype, shape=noisy_state.shape)
         meta_bytes = msgspec.msgpack.encode(meta)
