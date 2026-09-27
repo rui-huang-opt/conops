@@ -271,7 +271,6 @@ class BlockUniformQuantize:
         source_dtype = np.dtype(meta.source_dtype)
 
         quantized_state = np.frombuffer(payload, dtype=dtype).reshape(meta.shape)
-
         flat_state = quantized_state.reshape(-1)
 
         if flat_state.size == 0:
@@ -292,19 +291,13 @@ class BlockUniformQuantize:
                 n_full_blocks, block_size
             )
 
-            np.multiply(
-                full_blocks,
-                scales[:n_full_blocks, None],
-                out=output_blocks,
-                casting="unsafe",
-            )
+            np.multiply(full_blocks, scales[:n_full_blocks, None], out=output_blocks)
 
         if full_size < flat_state.size:
             np.multiply(
                 flat_state[full_size:],
                 scales[n_full_blocks],
                 out=dequantized_state[full_size:],
-                casting="unsafe",
             )
 
         return dequantized_state.reshape(meta.shape)
