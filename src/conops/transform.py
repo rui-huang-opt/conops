@@ -13,21 +13,29 @@ class BasicMeta(msgspec.Struct, frozen=True):
 
 class QuantizeMeta(msgspec.Struct, frozen=True):
     source_dtype: str
-    quantized_dtype: str
+    dtype: str
     shape: tuple[int, ...]
     scale: float
 
 
+class BlockQuantizeMeta(msgspec.Struct, frozen=True):
+    source_dtype: str
+    dtype: str
+    shape: tuple[int, ...]
+    block_size: int
+    scales: tuple[float, ...]
+
+
 class FixedQuantizeMeta(msgspec.Struct, frozen=True):
     source_dtype: str
-    quantized_dtype: str
+    dtype: str
     shape: tuple[int, ...]
     step: float
 
 
 class DitheredQuantizeMeta(msgspec.Struct, frozen=True):
     source_dtype: str
-    quantized_dtype: str
+    dtype: str
     shape: tuple[int, ...]
     step: float
     seed: int
@@ -104,25 +112,25 @@ class UniformQuantize:
 
     Parameters
     ----------
-    quantized_dtype : str, optional
+    dtype : str, optional
         Signed integer data type used for quantization.
         Defaults to ``"int8"``.
 
     Raises
     ------
     TypeError
-        If ``quantized_dtype`` is not a signed integer data type.
+        If ``dtype`` is not a signed integer data type.
     """
 
-    def __init__(self, quantized_dtype: str = "int8") -> None:
-        dtype = np.dtype(quantized_dtype)
+    def __init__(self, dtype: str = "int8") -> None:
+        dtype_ = np.dtype(dtype)
 
-        if not np.issubdtype(dtype, np.signedinteger):
-            raise TypeError("quantized_dtype must be a signed integer dtype")
+        if not np.issubdtype(dtype_, np.signedinteger):
+            raise TypeError("dtype must be a signed integer dtype")
 
-        info = np.iinfo(dtype)
+        info = np.iinfo(dtype_)
 
-        self.quantized_dtype = dtype
+        self.dtype = dtype_
         self._qmax = min(abs(info.min), info.max)
 
     def encode(self, state: NDArray) -> tuple[bytes, NDArray]:
@@ -138,11 +146,11 @@ class UniformQuantize:
         rounded_state = np.round(scaled_state)
         clipped_state = np.clip(rounded_state, -self._qmax, self._qmax)
 
-        quantized_state = clipped_state.astype(self.quantized_dtype, copy=False)
+        quantized_state = clipped_state.astype(self.dtype, copy=False)
 
         meta = QuantizeMeta(
             source_dtype=source_dtype,
-            quantized_dtype=self.quantized_dtype.str,
+            dtype=self.dtype.str,
             shape=quantized_state.shape,
             scale=scale,
         )
@@ -154,12 +162,152 @@ class UniformQuantize:
     def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
         meta = msgspec.msgpack.decode(meta_bytes, type=QuantizeMeta)
 
-        dtype = np.dtype(meta.quantized_dtype)
+        dtype = np.dtype(meta.dtype)
         source_dtype = np.dtype(meta.source_dtype)
 
         quantized_state = np.frombuffer(payload, dtype=dtype).reshape(meta.shape)
 
         return (quantized_state * meta.scale).astype(source_dtype, copy=False)
+
+
+class BlockUniformQuantize:
+    """
+    Block-wise dynamic symmetric uniform quantization transform.
+
+    The input state is flattened and divided into fixed-size blocks.
+    Each block is quantized independently using a scale determined by
+    the maximum absolute value within that block.
+
+    For each block, the scale is defined as
+
+        scale = max(abs(block)) / q_max,
+
+    where ``q_max`` is the maximum positive value representable by the
+    target signed integer type.
+
+    Parameters
+    ----------
+    block_size : int, optional
+        Number of elements per quantization block.
+        Defaults to ``256``.
+
+    dtype : str, optional
+        Signed integer data type used for quantization.
+        Defaults to ``"int8"``.
+
+    Raises
+    ------
+    ValueError
+        If ``block_size`` is not positive.
+
+    TypeError
+        If ``dtype`` is not a signed integer data type.
+    """
+
+    def __init__(self, block_size: int = 256, dtype: str = "int8") -> None:
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
+
+        dtype_ = np.dtype(dtype)
+
+        if not np.issubdtype(dtype_, np.signedinteger):
+            raise TypeError("dtype must be a signed integer dtype")
+
+        info = np.iinfo(dtype_)
+
+        self.block_size = block_size
+        self.dtype = dtype_
+        self._qmax = min(abs(info.min), info.max)
+
+    def encode(self, state: NDArray) -> tuple[bytes, NDArray]:
+        flat_state = state.reshape(-1)
+
+        if flat_state.size == 0:
+            scales = np.empty(0, dtype=np.float64)
+            quantized_state = flat_state.astype(self.dtype, copy=False)
+            quantized_state = quantized_state.reshape(state.shape)
+
+        else:
+            n_blocks = (flat_state.size + self.block_size - 1) // self.block_size
+
+            padded_size = n_blocks * self.block_size
+
+            padded_state = np.zeros(padded_size, dtype=state.dtype)
+            padded_state[: flat_state.size] = flat_state
+
+            blocks = padded_state.reshape(n_blocks, self.block_size)
+
+            max_abs = np.max(np.abs(blocks), axis=1)
+
+            scales = np.where(max_abs > 0, max_abs / self._qmax, 1.0)
+
+            scaled_blocks = blocks / scales[:, None]
+            rounded_blocks = np.round(scaled_blocks)
+
+            quantized_blocks = np.clip(rounded_blocks, -self._qmax, self._qmax).astype(
+                self.dtype, copy=False
+            )
+
+            quantized_state = quantized_blocks.reshape(-1)[: flat_state.size].reshape(
+                state.shape
+            )
+
+        meta = BlockQuantizeMeta(
+            source_dtype=state.dtype.str,
+            dtype=self.dtype.str,
+            shape=state.shape,
+            block_size=self.block_size,
+            scales=tuple(float(scale) for scale in scales),
+        )
+
+        meta_bytes = msgspec.msgpack.encode(meta)
+
+        return meta_bytes, quantized_state
+
+    def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
+        meta = msgspec.msgpack.decode(meta_bytes, type=BlockQuantizeMeta)
+
+        dtype = np.dtype(meta.dtype)
+        source_dtype = np.dtype(meta.source_dtype)
+
+        quantized_state = np.frombuffer(payload, dtype=dtype).reshape(meta.shape)
+
+        flat_state = quantized_state.reshape(-1)
+
+        if flat_state.size == 0:
+            return flat_state.astype(source_dtype, copy=False).reshape(meta.shape)
+
+        scales = np.asarray(meta.scales, dtype=source_dtype)
+
+        n_full_blocks = flat_state.size // meta.block_size
+        full_size = n_full_blocks * meta.block_size
+
+        dequantized_state = np.empty(flat_state.size, dtype=source_dtype)
+
+        if n_full_blocks > 0:
+            block_size = meta.block_size
+
+            full_blocks = flat_state[:full_size].reshape(n_full_blocks, block_size)
+            output_blocks = dequantized_state[:full_size].reshape(
+                n_full_blocks, block_size
+            )
+
+            np.multiply(
+                full_blocks,
+                scales[:n_full_blocks, None],
+                out=output_blocks,
+                casting="unsafe",
+            )
+
+        if full_size < flat_state.size:
+            np.multiply(
+                flat_state[full_size:],
+                scales[n_full_blocks],
+                out=dequantized_state[full_size:],
+                casting="unsafe",
+            )
+
+        return dequantized_state.reshape(meta.shape)
 
 
 class FixedUniformQuantize:
@@ -175,24 +323,24 @@ class FixedUniformQuantize:
     step : float
         Quantization step size.
 
-    quantized_dtype : str, optional
+    dtype : str, optional
         Signed integer data type used for quantization.
         Defaults to ``"int16"``.
     """
 
-    def __init__(self, step: float, quantized_dtype: str = "int16") -> None:
+    def __init__(self, step: float, dtype: str = "int16") -> None:
         if step <= 0:
             raise ValueError("step must be positive")
 
-        dtype = np.dtype(quantized_dtype)
+        dtype_ = np.dtype(dtype)
 
-        if not np.issubdtype(dtype, np.signedinteger):
-            raise TypeError("quantized_dtype must be a signed integer dtype")
+        if not np.issubdtype(dtype_, np.signedinteger):
+            raise TypeError("dtype must be a signed integer dtype")
 
-        info = np.iinfo(dtype)
+        info = np.iinfo(dtype_)
 
         self.step = step
-        self.quantized_dtype = dtype
+        self.dtype = dtype_
         self._qmax = min(abs(info.min), info.max)
 
     def encode(self, state: NDArray) -> tuple[bytes, NDArray]:
@@ -202,11 +350,11 @@ class FixedUniformQuantize:
         if np.any(np.abs(rounded_state) > self._qmax):
             raise OverflowError("state exceeds the representable quantization range")
 
-        quantized_state = rounded_state.astype(self.quantized_dtype, copy=False)
+        quantized_state = rounded_state.astype(self.dtype, copy=False)
 
         meta = FixedQuantizeMeta(
             source_dtype=state.dtype.str,
-            quantized_dtype=self.quantized_dtype.str,
+            dtype=self.dtype.str,
             shape=state.shape,
             step=self.step,
         )
@@ -218,7 +366,7 @@ class FixedUniformQuantize:
     def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
         meta = msgspec.msgpack.decode(meta_bytes, type=FixedQuantizeMeta)
 
-        dtype = np.dtype(meta.quantized_dtype)
+        dtype = np.dtype(meta.dtype)
         source_dtype = np.dtype(meta.source_dtype)
 
         quantized_state = np.frombuffer(payload, dtype=dtype).reshape(meta.shape)
@@ -237,20 +385,20 @@ class StochasticQuantize:
 
     Parameters
     ----------
-    quantized_dtype : str, optional
+    dtype : str, optional
         Signed integer data type used for quantization.
         Defaults to ``"int8"``.
     """
 
-    def __init__(self, quantized_dtype: str = "int8") -> None:
-        dtype = np.dtype(quantized_dtype)
+    def __init__(self, dtype: str = "int8") -> None:
+        dtype_ = np.dtype(dtype)
 
-        if not np.issubdtype(dtype, np.signedinteger):
-            raise TypeError("quantized_dtype must be a signed integer dtype")
+        if not np.issubdtype(dtype_, np.signedinteger):
+            raise TypeError("dtype must be a signed integer dtype")
 
-        info = np.iinfo(dtype)
+        info = np.iinfo(dtype_)
 
-        self.quantized_dtype = dtype
+        self.dtype = dtype_
         self._qmax = min(abs(info.min), info.max)
 
     def encode(self, state: NDArray) -> tuple[bytes, NDArray]:
@@ -269,11 +417,11 @@ class StochasticQuantize:
 
         quantized_state = lower + (random_values < probability)
         quantized_state = np.clip(quantized_state, -self._qmax, self._qmax)
-        quantized_state = quantized_state.astype(self.quantized_dtype, copy=False)
+        quantized_state = quantized_state.astype(self.dtype, copy=False)
 
         meta = QuantizeMeta(
             source_dtype=state.dtype.str,
-            quantized_dtype=self.quantized_dtype.str,
+            dtype=self.dtype.str,
             shape=state.shape,
             scale=scale,
         )
@@ -285,7 +433,7 @@ class StochasticQuantize:
     def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
         meta = msgspec.msgpack.decode(meta_bytes, type=QuantizeMeta)
 
-        dtype = np.dtype(meta.quantized_dtype)
+        dtype = np.dtype(meta.dtype)
         source_dtype = np.dtype(meta.source_dtype)
 
         quantized_state = np.frombuffer(payload, dtype=dtype).reshape(meta.shape)
@@ -353,7 +501,7 @@ class DitheredQuantize:
     step : float
         Quantization step size.
 
-    quantized_dtype : str, optional
+    dtype : str, optional
         Signed integer data type used for quantization.
         Defaults to ``"int16"``.
 
@@ -363,22 +511,22 @@ class DitheredQuantize:
         If ``step`` is not positive.
 
     TypeError
-        If ``quantized_dtype`` is not a signed integer data type.
+        If ``dtype`` is not a signed integer data type.
     """
 
-    def __init__(self, step: float, quantized_dtype: str = "int16") -> None:
+    def __init__(self, step: float, dtype: str = "int16") -> None:
         if step <= 0:
             raise ValueError("step must be positive")
 
-        dtype = np.dtype(quantized_dtype)
+        dtype_ = np.dtype(dtype)
 
-        if not np.issubdtype(dtype, np.signedinteger):
-            raise TypeError("quantized_dtype must be a signed integer dtype")
+        if not np.issubdtype(dtype_, np.signedinteger):
+            raise TypeError("dtype must be a signed integer dtype")
 
-        info = np.iinfo(dtype)
+        info = np.iinfo(dtype_)
 
         self.step = step
-        self.quantized_dtype = dtype
+        self.dtype = dtype_
         self._qmax = min(abs(info.min), info.max)
 
     def encode(self, state: NDArray) -> tuple[bytes, NDArray]:
@@ -394,11 +542,11 @@ class DitheredQuantize:
         if np.any(np.abs(rounded_state) > self._qmax):
             raise OverflowError("state exceeds the representable quantization range")
 
-        quantized_state = rounded_state.astype(self.quantized_dtype, copy=False)
+        quantized_state = rounded_state.astype(self.dtype, copy=False)
 
         meta = DitheredQuantizeMeta(
             source_dtype=state.dtype.str,
-            quantized_dtype=self.quantized_dtype.str,
+            dtype=self.dtype.str,
             shape=state.shape,
             step=self.step,
             seed=seed,
@@ -411,7 +559,7 @@ class DitheredQuantize:
     def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
         meta = msgspec.msgpack.decode(meta_bytes, type=DitheredQuantizeMeta)
 
-        dtype = np.dtype(meta.quantized_dtype)
+        dtype = np.dtype(meta.dtype)
         source_dtype = np.dtype(meta.source_dtype)
 
         quantized_state = np.frombuffer(payload, dtype=dtype).reshape(meta.shape)
@@ -439,6 +587,11 @@ class DPMechanism:
     """
 
     def __init__(self, epsilon: float, sensitivity: float):
+        if epsilon <= 0:
+            raise ValueError("epsilon must be positive")
+        if sensitivity < 0:
+            raise ValueError("sensitivity must be non-negative")
+
         self.epsilon = epsilon
         self.sensitivity = sensitivity
         self._scale = sensitivity / epsilon
@@ -471,6 +624,9 @@ class GaussianNoise:
     """
 
     def __init__(self, loc: float = 0.0, scale: float = 1.0):
+        if scale <= 0:
+            raise ValueError("scale must be positive")
+
         self.loc = loc
         self.scale = scale
 
