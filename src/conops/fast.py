@@ -59,6 +59,7 @@ class FastNetwork:
         namespace: str = "default",
         transform: Transform | None = None,
         context: zmq.SyncContext | None = None,
+        peer_endpoints: dict[str, str] | None = None,
     ) -> None:
         self._node_id = node_id
         self._namespace = namespace
@@ -76,7 +77,18 @@ class FastNetwork:
 
         self._out_socket = self._context.socket(zmq.ROUTER)
         self._out_socket.setsockopt(zmq.LINGER, 0)
-        port = self._out_socket.bind_to_random_port("tcp://*")
+
+        if peer_endpoints is None:
+            port = self._out_socket.bind_to_random_port("tcp://*")
+        else:
+            endpoint = peer_endpoints[self._node_id]
+            parsed = urlsplit(endpoint)
+
+            if parsed.scheme != "tcp" or parsed.hostname is None or parsed.port is None:
+                raise ValueError(f"Invalid TCP endpoint: {endpoint}")
+
+            port = parsed.port
+            self._out_socket.bind(f"tcp://*:{port}")
 
         identity = self._node_id.encode("utf-8")
 
@@ -88,7 +100,15 @@ class FastNetwork:
 
             self._dealers[peer_id] = dealer
 
-        self._bootstrap(port)
+        if peer_endpoints is None:
+            self._bootstrap(port)
+        else:
+            missing = self._neighbors.keys() - peer_endpoints.keys()
+            if missing:
+                raise ValueError(f"Missing peer endpoints: {missing}")
+
+            endpoints = {j: peer_endpoints[j] for j in self._neighbors}
+            self._connect_to_neighbors(endpoints)
 
     @property
     def node_id(self) -> str:
