@@ -253,8 +253,8 @@ class FastNetwork:
         logger.info("[%s] Connected to all %d neighbors.", self._node_id, self.degree)
 
     def neighborwise_exchange(
-        self, state_map: dict[str, NDArray[np.float64]]
-    ) -> dict[str, NDArray[np.float64]]:
+        self, state_map: dict[str, NDArray]
+    ) -> dict[str, NDArray]:
         """
         Exchanges the given state map with all neighbor nodes.
 
@@ -291,7 +291,7 @@ class FastNetwork:
 
         return neighbor_states
 
-    def exchange(self, state: NDArray[np.float64]) -> dict[str, NDArray[np.float64]]:
+    def exchange(self, state: NDArray) -> dict[str, NDArray]:
         """
         Exchanges the given state with all neighbor nodes.
 
@@ -319,7 +319,7 @@ class FastNetwork:
 
         return neighbor_states
 
-    def exchange_as_array(self, state: NDArray[np.float64]) -> NDArray[np.float64]:
+    def exchange_as_array(self, state: NDArray) -> NDArray:
         """
         Exchanges the given state with all neighbor nodes and returns their states as a stacked array.
 
@@ -348,7 +348,7 @@ class FastNetwork:
 
         return np.stack(neighbor_states, axis=0)
 
-    def laplacian(self, state: NDArray[np.float64]) -> NDArray[np.float64]:
+    def laplacian(self, state: NDArray) -> NDArray:
         """
         Computes the Laplacian of the given state vector based on the states of neighboring nodes.
 
@@ -369,7 +369,7 @@ class FastNetwork:
 
         return laplacian
 
-    def weighted_mix(self, state: NDArray[np.float64]) -> NDArray[np.float64]:
+    def weighted_mix(self, state: NDArray) -> NDArray:
         """
         Performs the weighted mixing operation for distributed optimization using the weight matrix W.
 
