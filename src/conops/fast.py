@@ -49,6 +49,12 @@ class FastNetwork:
     context : zmq.SyncContext | None, optional
         ZeroMQ context used by the network. If ``None``, the process-wide
         shared context returned by :meth:`zmq.Context.instance` is used.
+
+    peer_endpoints : dict[str, str] | None, optional
+        Mapping from neighbor node IDs to their TCP endpoints. If ``None``,
+        the network will use Pyre for neighbor discovery. If provided, the
+        network will connect directly to the specified endpoints, bypassing
+        Pyre discovery.
     """
 
     def __init__(
