@@ -1,4 +1,17 @@
+# Python
 **/*.egg-info/
 **/__pycache__/
 **/build/
+*.pyc
+
+# Rust
+/target/
+
+# Compiled extensions
+*.so
+*.pyd
+*.dll
+*.dylib
+
+# Development
 .vscode/

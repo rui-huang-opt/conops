@@ -1,6 +1,7 @@
+
 [build-system]
-requires = ["setuptools", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "conops"
@@ -8,7 +9,7 @@ version = "0.4.5"
 description = "A Python package for distributed consensus operations."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Rui Huang", email = "ruihuang0421@gmail.com" }]
 dependencies = [
     "numpy>=2.2.6",
@@ -20,5 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 examples = ["matplotlib>=3.10.3", "networkx>=3.4.2", "ray[default]==2.54.1"]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.maturin]
+python-source = "python"
+module-name = "conops._core"
+bindings = "pyo3"
