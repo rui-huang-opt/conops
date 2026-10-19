@@ -7,6 +7,6 @@ pub mod tcp;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<network::CoreNode>()?;
+    m.add_class::<network::CoreNetwork>()?;
     Ok(())
 }

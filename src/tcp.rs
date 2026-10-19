@@ -3,8 +3,6 @@ use std::io;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
-
 pub async fn send_message<W>(writer: &mut W, data: &[u8], max_size: usize) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,

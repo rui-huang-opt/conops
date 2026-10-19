@@ -1,55 +1,42 @@
-import socket
-import struct
+"""Run after `maturin develop`: python examples/test_rust_messages.py"""
 
-from conops._core import CoreNode
-
-
-def recv_exact(sock: socket.socket, size: int) -> bytes:
-    """从 TCP 字节流中准确读取指定长度的数据。"""
-    buffer = bytearray()
-
-    while len(buffer) < size:
-        chunk = sock.recv(size - len(buffer))
-
-        if not chunk:
-            raise ConnectionError("Connection closed unexpectedly")
-
-        buffer.extend(chunk)
-
-    return bytes(buffer)
+import time
+from conops._core import CoreNetwork
 
 
-def main():
-    # 1. Python 创建 Rust 对象
-    node = CoreNode("A", 5000)
+def wait_for_peer(node: CoreNetwork, peer: str, seconds: float = 3.0) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if peer in node.peers():
+            return
+        time.sleep(0.01)
+    raise TimeoutError(f"Peer {peer} was not registered in time")
+
+
+def main() -> None:
+    a = CoreNetwork("A", 5000)
+    b = CoreNetwork("B", 5001)
 
     try:
-        # 2. 启动 Rust 后台线程
-        node.start()
-        print("[Python] Rust node started")
+        a.start()
+        b.start()
 
-        # 3. Python 连接 Rust TCP Server
-        with socket.create_connection(("127.0.0.1", 5000), timeout=5) as sock:
-            message = b"Hello from Python!"
+        a.connect("B", "127.0.0.1:5001")
 
-            # 4. 发送长度前缀 + 数据
-            sock.sendall(struct.pack("!I", len(message)) + message)
+        wait_for_peer(a, "B")
+        wait_for_peer(b, "A")
 
-            print("[Python] Sent:", message)
+        a.send("B", b"Hello from A")
+        b.send("A", b"Hello from B")
 
-            # 5. 接收 Rust 返回的数据
-            length = struct.unpack("!I", recv_exact(sock, 4))[0]
+        assert b.recv(timeout=5) == ("A", b"Hello from A")
+        assert a.recv(timeout=5) == ("B", b"Hello from B")
 
-            reply = recv_exact(sock, length)
-
-            print("[Python] Received:", reply)
-
-            assert reply == message
+        print("PASS: two-way Rust TCP messages via Python")
 
     finally:
-        # 6. 关闭 Rust 后台线程
-        node.close()
-        print("[Python] Rust node stopped")
+        b.close()
+        a.close()
 
 
 if __name__ == "__main__":

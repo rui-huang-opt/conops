@@ -1,23 +1,16 @@
-class CoreNode:
-    """Rust-backed TCP network node."""
+class CoreNetwork:
+    """Rust TCP node (learning version; not yet a batch Exchange API)."""
 
-    def __init__(self, node_id: str, port: int) -> None:
-        """Create a network node.
-
-        Args:
-            node_id: Logical identifier of the node.
-            port: Local TCP listening port.
-        """
+    def __init__(self, node_id: str, port: int) -> None: ...
+    def start(self) -> None: ...
+    def connect(self, peer_id: str, address: str) -> None: ...
+    def peers(self) -> list[str]: ...
+    def send(self, peer_id: str, data: bytes) -> None:
+        """Enqueue a message for a peer; not an application delivery ACK."""
         ...
 
-    def start(self) -> None:
-        """Start the background Rust networking runtime.
-
-        Blocks until the TCP listener is initialized.
-        Raises RuntimeError if startup fails.
-        """
+    def recv(self, timeout: float = 5.0) -> tuple[str, bytes]:
+        """Return (peer_id, payload). Raise TimeoutError when no message arrives."""
         ...
 
-    def close(self) -> None:
-        """Stop the background runtime and join its worker thread."""
-        ...
+    def close(self) -> None: ...
