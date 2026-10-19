@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 
+pub mod discovery;
 pub mod exchange;
 pub mod message;
 pub mod network;
