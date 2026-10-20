@@ -7,6 +7,7 @@ transport, neighbor discovery, exchange matching and connection recovery.
 import struct
 from collections.abc import KeysView, Mapping
 from typing import cast
+from urllib.parse import urlsplit
 
 import numpy as np
 from numpy.typing import NDArray
@@ -17,9 +18,35 @@ from .transform import Identity, Transform
 _META_LENGTH = struct.Struct("!I")
 
 
+def _parse_tcp_endpoint(endpoint: str) -> tuple[str, int]:
+    """Return a TCP host:port address suitable for Tokio, plus its port."""
+    try:
+        parsed = urlsplit(endpoint)
+        host = parsed.hostname
+        port = parsed.port
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid TCP endpoint: {endpoint!r}") from exc
+
+    if (
+        parsed.scheme != "tcp"
+        or not host
+        or port is None
+        or port == 0
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"Invalid TCP endpoint: {endpoint!r}")
+
+    if ":" in host:  # IPv6 literal; preserve brackets for Tokio's address parser.
+        host = f"[{host}]"
+    return f"{host}:{port}", port
+
+
 class Network:
-    """
-    Synchronous neighbor exchanges of NumPy arrays over the Rust backend.
+    """Synchronous neighbor exchanges of NumPy arrays over the Rust backend.
 
     Parameters
     ----------
@@ -30,21 +57,26 @@ class Network:
         Fixed neighbor IDs and their associated weights.
 
     group_id : str, optional
-        Group identifier used to isolate independent network instances.
-        Defaults to ``"default"``.
+        Group identifier for mDNS discovery. Defaults to ``"default"``.
 
     port : int, optional
         Local TCP listening port. Defaults to ``0`` for automatic assignment.
+        With ``peer_endpoints``, the local port is taken from this node's endpoint.
 
     transform : Transform | None, optional
         Transformation applied to exchanged states. Defaults to ``Identity``.
 
+    peer_endpoints : Mapping[str, str] | None, optional
+        TCP endpoints for this node and every neighbor, e.g.
+        ``{"0": "tcp://node-0:5000", "1": "tcp://node-1:5000"}``.
+        When provided, disables mDNS discovery and uses the configured
+        addresses for initial connections and reconnection attempts.
+        When ``None``, neighbors are discovered through mDNS.
+
     Notes
     -----
-    Each exchange requires a monotonically increasing ``exchange_id``
-    to match messages across neighboring nodes. The network handles
-    connection recovery and message replay but does not manage
-    algorithm iterations or synchronization logic.
+    Exchange IDs must be strictly increasing on each node, and neighboring
+    nodes must use the same ID for the same logical exchange.
     """
 
     def __init__(
@@ -55,16 +87,22 @@ class Network:
         group_id: str = "default",
         port: int = 0,
         transform: Transform | None = None,
+        peer_endpoints: Mapping[str, str] | None = None,
     ) -> None:
         self._node_id = node_id
         self._neighbors = dict(neighbors)
         self._transform = transform if transform is not None else Identity()
+
+        peer_endpoints_ = None
+        if peer_endpoints is not None:
+            port, peer_endpoints_ = self._resolve_peer_endpoints(peer_endpoints, port)
 
         self._core = CoreNetwork(
             node_id,
             port,
             neighbors=list(self._neighbors),
             group_id=group_id,
+            peer_endpoints=peer_endpoints_,
         )
 
     @property
@@ -87,7 +125,7 @@ class Network:
         self._core.wait_connected(timeout=timeout)
 
     def connect(self, peer_id: str, address: str) -> None:
-        """Manually connect to a neighbor (usually unnecessary with mDNS)."""
+        """Manually connect to a neighbor (usually unnecessary in either mode)."""
         self._core.connect(peer_id, address)
 
     def peers(self) -> list[str]:
@@ -96,6 +134,35 @@ class Network:
 
     def close(self) -> None:
         self._core.close()
+
+    def _resolve_peer_endpoints(
+        self,
+        peer_endpoints: Mapping[str, str],
+        port: int,
+    ) -> tuple[int, dict[str, str]]:
+        expected = set(self._neighbors) | {self._node_id}
+        provided = set(peer_endpoints)
+
+        if provided != expected:
+            missing = expected - provided
+            extra = provided - expected
+            raise ValueError(
+                "peer_endpoints must cover this node and all neighbors; "
+                f"missing={sorted(missing)}, extra={sorted(extra)}"
+            )
+
+        parsed = {
+            peer_id: _parse_tcp_endpoint(peer_endpoints[peer_id])
+            for peer_id in expected
+        }
+
+        local_port = parsed[self._node_id][1]
+        if port not in (0, local_port):
+            raise ValueError(f"Port mismatch: {port} != {local_port}")
+
+        addresses = {peer_id: parsed[peer_id][0] for peer_id in self._neighbors}
+
+        return local_port, addresses
 
     def _prepare(self, state: NDArray) -> tuple[bytes, NDArray[np.uint8]]:
         meta, payload = self._transform.encode(state)

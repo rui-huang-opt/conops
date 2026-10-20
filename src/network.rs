@@ -465,6 +465,7 @@ async fn run_network(
     port: u16,
     neighbors: Option<HashSet<String>>,
     group_id: String,
+    peer_endpoints: Option<HashMap<String, String>>,
     mut stop_rx: oneshot::Receiver<()>,
     mut command_rx: async_mpsc::UnboundedReceiver<Command>,
     ready_tx: mpsc::SyncSender<Result<(), String>>,
@@ -488,8 +489,9 @@ async fn run_network(
             return;
         }
     };
-    // None = manual mode (backwards compatible). Some(...) = fixed-topology mDNS.
-    let mut discovery = if neighbors.is_some() {
+    // Use mDNS only for fixed-topology networks without static endpoints.
+    // Explicit peer endpoints keep the fixed topology but skip multicast discovery.
+    let mut discovery = if neighbors.is_some() && peer_endpoints.is_none() {
         match Discovery::new(&node_id, actual_port, &group_id) {
             Ok(discovery) => Some(discovery),
             Err(err) => {
@@ -511,8 +513,13 @@ async fn run_network(
     let mut next_session = 0u64;
     let mut connecting = HashSet::<String>::new();
     let mut connected_before = HashSet::<String>::new();
-    // Remember known addresses for both manual connect() and mDNS discovery.
-    let mut addresses = HashMap::<String, Vec<String>>::new();
+    // Static endpoints are known from startup, so the existing retry and replay
+    // paths work without mDNS. Only the smaller node ID initiates connections.
+    let mut addresses: HashMap<String, Vec<String>> = peer_endpoints
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(peer_id, address)| (peer_id, vec![address]))
+        .collect();
     let mut retry = interval(CONNECT_RETRY_INTERVAL);
     retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -833,6 +840,7 @@ pub struct CoreNetwork {
     port: u16,
     neighbors: Option<HashSet<String>>,
     group_id: String,
+    peer_endpoints: Option<HashMap<String, String>>,
     commands: Option<async_mpsc::UnboundedSender<Command>>,
     stop_tx: Option<oneshot::Sender<()>>,
     worker: Option<thread::JoinHandle<()>>,
@@ -933,12 +941,13 @@ impl CoreNetwork {
 #[pymethods]
 impl CoreNetwork {
     #[new]
-    #[pyo3(signature = (node_id, port=0, neighbors=None, group_id="default"))]
+    #[pyo3(signature = (node_id, port=0, neighbors=None, group_id="default", peer_endpoints=None))]
     pub fn new(
         node_id: String,
         port: u16,
         neighbors: Option<Vec<String>>,
         group_id: &str,
+        peer_endpoints: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         if node_id.is_empty() || node_id.contains(char::is_whitespace) {
             return Err(PyValueError::new_err(
@@ -963,11 +972,26 @@ impl CoreNetwork {
             })
             .transpose()?;
 
+        if let Some(ref endpoints) = peer_endpoints {
+            let expected = neighbors.as_ref().ok_or_else(|| {
+                PyValueError::new_err("peer_endpoints requires configured neighbors")
+            })?;
+            if endpoints.len() != expected.len()
+                || endpoints.keys().any(|id| !expected.contains(id))
+                || endpoints.values().any(String::is_empty)
+            {
+                return Err(PyValueError::new_err(
+                    "peer_endpoints must contain exactly the configured neighbors with nonempty addresses",
+                ));
+            }
+        }
+
         Ok(Self {
             node_id,
             port,
             neighbors,
             group_id: group_id.to_owned(),
+            peer_endpoints,
             commands: None,
             stop_tx: None,
             worker: None,
@@ -986,13 +1010,15 @@ impl CoreNetwork {
         let port = self.port;
         let neighbors = self.neighbors.clone();
         let group_id = self.group_id.clone();
+        let peer_endpoints = self.peer_endpoints.clone();
         let worker = thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build();
             match rt {
                 Ok(rt) => rt.block_on(run_network(
-                    node_id, port, neighbors, group_id, stop_rx, command_rx, ready_tx,
+                    node_id, port, neighbors, group_id, peer_endpoints,
+                    stop_rx, command_rx, ready_tx,
                 )),
                 Err(err) => {
                     let _ = ready_tx.send(Err(err.to_string()));
