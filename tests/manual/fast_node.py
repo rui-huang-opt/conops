@@ -38,6 +38,10 @@ def main() -> None:
 
         k = 0
 
+        n_warmup = 10
+        for _ in range(n_warmup):
+            network.exchange(x)
+
         before = time.monotonic()
 
         while k < args.n_iter - 1:

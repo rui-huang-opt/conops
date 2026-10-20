@@ -51,23 +51,30 @@ def main() -> None:
         x = npr.uniform(-100.0, 100.0, args.n_state)
         y = npr.uniform(-100.0, 100.0, args.n_state)
 
-        before = time.monotonic()
+        n_warmup = 10
+        for exchange_id in range(n_warmup):
+            network.exchange(
+                exchange_id,
+                x,
+                timeout=args.timeout,
+            )
+
+        before = time.perf_counter()
 
         for k in range(args.n_iter - 1):
-            # Each communication requires a unique exchange ID.
             x = x - 0.45 * network.laplacian(
-                exchange_id=2 * k,
+                exchange_id=n_warmup + 2 * k,
                 state=x,
                 timeout=args.timeout,
             )
 
             y = y - 0.2 * network.laplacian(
-                exchange_id=2 * k + 1,
+                exchange_id=n_warmup + 2 * k + 1,
                 state=y,
                 timeout=args.timeout,
             )
 
-        elapsed = time.monotonic() - before
+        elapsed = time.perf_counter() - before
 
         print(
             f"[{args.node_id}] - Final: x = {x}, y = {y} (elapsed {elapsed:.3f}s)",

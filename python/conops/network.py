@@ -1,13 +1,12 @@
-"""
-NumPy-facing ConOps network, backed by the Rust CoreNetwork.
+"""NumPy-facing ConOps network, backed by the Rust CoreNetwork.
 
 The Python layer owns serialization and numerical operations; Rust owns
 transport, neighbor discovery, exchange matching and connection recovery.
 """
 
 import struct
-import time
-from typing import KeysView, Mapping, cast
+from collections.abc import KeysView, Mapping
+from typing import cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -28,8 +27,7 @@ class Network:
     neighbors : Mapping[str, float]
         Fixed neighbor IDs and their weights, as used by ``weighted_mix``.
     port : int, optional
-        Local TCP listening port. Defaults to 0, allowing the operating system
-        to automatically assign an available port.
+        Local TCP listening port. Defaults to 0 for automatic port assignment.
     group_id : str
         mDNS discovery group used to isolate independent experiments.
     transform : Transform | None
@@ -59,11 +57,6 @@ class Network:
             neighbors=list(self._neighbors),
             group_id=group_id,
         )
-
-        self._profile_pack = 0.0
-        self._profile_core = 0.0
-        self._profile_unpack = 0.0
-        self._profile_count = 0
 
     @property
     def node_id(self) -> str:
@@ -95,7 +88,7 @@ class Network:
     def close(self) -> None:
         self._core.close()
 
-    def _pack(self, state: NDArray) -> bytes:
+    def _prepare(self, state: NDArray) -> tuple[bytes, NDArray[np.uint8]]:
         meta, payload = self._transform.encode(state)
         if not isinstance(meta, bytes):
             raise TypeError("Transform.encode() must return metadata as bytes")
@@ -106,27 +99,24 @@ class Network:
         if len(meta) > 0xFFFFFFFF:
             raise ValueError("Transform metadata is too large")
 
-        payload = np.ascontiguousarray(payload)
+        # No Python bytes allocation: only make a copy when the input is strided.
+        # Flatten first, so scalar and multidimensional arrays work too.
+        contiguous = np.ascontiguousarray(payload)
+        return meta, contiguous.reshape(-1).view(np.uint8)
 
-        return b"".join((
-            _META_LENGTH.pack(len(meta)),
-            meta,
-            payload.data.cast("B"),
-        ))
-
-    def _unpack(self, frame: bytes) -> NDArray:
-        if len(frame) < _META_LENGTH.size:
+    def _unpack(self, frame: bytes | memoryview) -> NDArray:
+        view = memoryview(frame)
+        if len(view) < _META_LENGTH.size:
             raise ValueError("Invalid state frame: missing metadata length")
-
-        (meta_length,) = _META_LENGTH.unpack_from(frame)
+        (meta_length,) = _META_LENGTH.unpack_from(view)
         offset = _META_LENGTH.size + meta_length
-
-        if offset > len(frame):
+        if offset > len(view):
             raise ValueError("Invalid state frame: truncated metadata")
 
-        meta = frame[_META_LENGTH.size:offset]
-        payload = cast(bytes, memoryview(frame)[offset:])
-
+        meta = bytes(view[_META_LENGTH.size : offset])
+        # Existing transforms use np.frombuffer(), which accepts memoryview.
+        # The cast retains their old annotation without copying the payload.
+        payload = cast(bytes, view[offset:])
         return self._transform.decode(meta, payload)
 
     def exchange(
@@ -136,31 +126,15 @@ class Network:
         *,
         timeout: float | None = None,
     ) -> dict[str, NDArray]:
-        t0 = time.perf_counter()
-
-        frame = self._pack(state)
-
-        t1 = time.perf_counter()
-
-        incoming = self._core.exchange(
-            exchange_id, frame, timeout=timeout
+        """Exchange ``state`` with all fixed neighbors at the given ID."""
+        meta, payload = self._prepare(state)
+        incoming = self._core.exchange_array(
+            exchange_id,
+            meta,
+            payload,
+            timeout=timeout,
         )
-
-        t2 = time.perf_counter()
-
-        result = {
-            peer_id: self._unpack(data)
-            for peer_id, data in incoming.items()
-        }
-
-        t3 = time.perf_counter()
-
-        self._profile_pack += t1 - t0
-        self._profile_core += t2 - t1
-        self._profile_unpack += t3 - t2
-        self._profile_count += 1
-
-        return result
+        return {peer_id: self._unpack(data) for peer_id, data in incoming.items()}
 
     def exchange_as_array(
         self,

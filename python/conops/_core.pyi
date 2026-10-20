@@ -1,10 +1,11 @@
-class CoreNetwork:
-    """Rust TCP network with fixed-neighbor mDNS discovery and synchronous Exchange."""
+import numpy as np
+from numpy.typing import NDArray
 
+class CoreNetwork:
     def __init__(
         self,
         node_id: str,
-        port: int,
+        port: int = 0,
         neighbors: list[str] | None = None,
         group_id: str = "default",
     ) -> None: ...
@@ -17,5 +18,12 @@ class CoreNetwork:
         exchange_id: int,
         data: bytes,
         timeout: float | None = None,
-    ) -> dict[str, bytes]: ...
+    ) -> dict[str, memoryview]: ...
+    def exchange_array(
+        self,
+        exchange_id: int,
+        meta: bytes,
+        payload: NDArray[np.uint8],
+        timeout: float | None = None,
+    ) -> dict[str, memoryview]: ...
     def close(self) -> None: ...

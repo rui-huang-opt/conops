@@ -1,16 +1,19 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    future, io,
+    ffi::{c_int, c_void},
+    future, io, ptr,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
+use numpy::PyReadonlyArray1;
 use pyo3::{
-    exceptions::{PyRuntimeError, PyTimeoutError, PyValueError},
+    exceptions::{PyBufferError, PyRuntimeError, PyTimeoutError, PyValueError},
+    ffi,
     prelude::*,
-    types::PyBytes,
+    types::{PyBytes, PyMemoryView},
 };
 use tokio::{
     net::{TcpListener, TcpStream, tcp::OwnedReadHalf, tcp::OwnedWriteHalf},
@@ -41,6 +44,65 @@ const MAX_UNACKED_BYTES: usize = 128 * 1024 * 1024;
 type Reply = mpsc::Sender<Result<(), String>>;
 type ExchangeResult = Result<HashMap<String, Bytes>, String>;
 type ExchangeReply = mpsc::Sender<ExchangeResult>;
+
+/// A read-only Python buffer backed by a Rust Bytes allocation.
+/// Python memoryview and NumPy references keep this owner alive.
+#[pyclass(frozen)]
+struct ReceivedBuffer {
+    data: Bytes,
+}
+
+#[pymethods]
+impl ReceivedBuffer {
+    // SAFETY: `data` is immutable and owned by this object. The exported
+    // Py_buffer holds a strong reference to `slf`, so `data` cannot be freed
+    // until the consumer releases its view. No reallocations are possible.
+    unsafe fn __getbuffer__(
+        slf: Bound<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: c_int,
+    ) -> PyResult<()> {
+        if view.is_null() {
+            return Err(PyBufferError::new_err("Null buffer view"));
+        }
+        if flags & ffi::PyBUF_WRITABLE != 0 {
+            return Err(PyBufferError::new_err("Buffer is read-only"));
+        }
+
+        let (data_ptr, data_len) = {
+            let owner = slf.borrow();
+            (owner.data.as_ptr(), owner.data.len() as isize)
+        };
+
+        unsafe {
+            (*view).buf = data_ptr as *mut c_void;
+            (*view).len = data_len;
+            (*view).readonly = 1;
+            (*view).itemsize = 1;
+            (*view).format = if flags & ffi::PyBUF_FORMAT != 0 {
+                c"B".as_ptr() as *mut _
+            } else {
+                ptr::null_mut()
+            };
+            (*view).ndim = 1;
+            (*view).shape = if flags & ffi::PyBUF_ND != 0 {
+                &mut (*view).len
+            } else {
+                ptr::null_mut()
+            };
+            (*view).strides = if flags & ffi::PyBUF_STRIDES == ffi::PyBUF_STRIDES {
+                &mut (*view).itemsize
+            } else {
+                ptr::null_mut()
+            };
+            (*view).suboffsets = ptr::null_mut();
+            (*view).internal = ptr::null_mut();
+            // Move a strong Python reference into the Py_buffer.
+            (*view).obj = slf.into_any().into_ptr();
+        }
+        Ok(())
+    }
+}
 
 enum Command {
     Connect {
@@ -776,6 +838,71 @@ pub struct CoreNetwork {
     worker: Option<thread::JoinHandle<()>>,
 }
 
+impl CoreNetwork {
+    /// Shared blocking exchange path; the frame is already encoded and owned by Rust.
+    fn exchange_encoded(
+        &self,
+        py: Python<'_>,
+        exchange_id: u64,
+        encoded: Bytes,
+        timeout: Option<f64>,
+    ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
+        let deadline = match timeout {
+            Some(seconds) => {
+                if !seconds.is_finite() || seconds < 0.0 {
+                    return Err(PyValueError::new_err("timeout must be finite and >= 0"));
+                }
+                Some(
+                    Duration::try_from_secs_f64(seconds)
+                        .map_err(|_| PyValueError::new_err("timeout is too large"))?,
+                )
+            }
+            None => None,
+        };
+        let commands = self
+            .commands
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Node is not started"))?;
+        let (reply, result_rx) = mpsc::channel();
+        commands
+            .send(Command::Exchange {
+                exchange_id,
+                data: encoded,
+                reply,
+            })
+            .map_err(|_| PyRuntimeError::new_err("Network worker has stopped"))?;
+
+        let result = py.detach(move || match deadline {
+            Some(duration) => result_rx.recv_timeout(duration),
+            None => result_rx
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        });
+        match result {
+            Ok(Ok(messages)) => {
+                let mut received = HashMap::with_capacity(messages.len());
+                for (peer_id, payload) in messages {
+                    let owner = Py::new(py, ReceivedBuffer { data: payload })?;
+                    let view = PyMemoryView::from(owner.bind(py).as_any())?;
+                    received.insert(peer_id, view.unbind());
+                }
+                Ok(received)
+            }
+            Ok(Err(err)) => Err(PyRuntimeError::new_err(err)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Cancel the pending local batch; late messages will be treated as obsolete.
+                let _ = commands.send(Command::CancelExchange { exchange_id });
+                Err(PyTimeoutError::new_err(format!(
+                    "Exchange {exchange_id} timed out"
+                )))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(PyRuntimeError::new_err(
+                "Network worker stopped during exchange",
+            )),
+        }
+    }
+}
+
 #[pymethods]
 impl CoreNetwork {
     #[new]
@@ -937,8 +1064,7 @@ impl CoreNetwork {
         }
     }
 
-    /// Send one payload to all registered peers and block until they all reply
-    /// with a message carrying the same exchange ID.
+    /// Existing raw-bytes interface, retained for direct CoreNetwork callers.
     #[pyo3(signature = (exchange_id, data, timeout=None))]
     pub fn exchange(
         &self,
@@ -946,59 +1072,44 @@ impl CoreNetwork {
         exchange_id: u64,
         data: &Bound<'_, PyBytes>,
         timeout: Option<f64>,
-    ) -> PyResult<HashMap<String, Py<PyBytes>>> {
-        let deadline = match timeout {
-            Some(seconds) => {
-                if !seconds.is_finite() || seconds < 0.0 {
-                    return Err(PyValueError::new_err("timeout must be finite and >= 0"));
-                }
-                Some(
-                    Duration::try_from_secs_f64(seconds)
-                        .map_err(|_| PyValueError::new_err("timeout is too large"))?,
-                )
-            }
-            None => None,
-        };
+    ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
         if data.as_bytes().len() > DATA_MAX_SIZE - message::HEADER_SIZE {
             return Err(PyValueError::new_err("Message too large"));
         }
-        let commands = self
-            .commands
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("Node is not started"))?;
-        let encoded = message::encode(exchange_id, data.as_bytes());
-        let (reply, result_rx) = mpsc::channel();
-        commands
-            .send(Command::Exchange {
-                exchange_id,
-                data: encoded,
-                reply,
-            })
-            .map_err(|_| PyRuntimeError::new_err("Network worker has stopped"))?;
+        self.exchange_encoded(
+            py,
+            exchange_id,
+            message::encode(exchange_id, data.as_bytes()),
+            timeout,
+        )
+    }
 
-        let result = py.detach(move || match deadline {
-            Some(duration) => result_rx.recv_timeout(duration),
-            None => result_rx
-                .recv()
-                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-        });
-        match result {
-            Ok(Ok(messages)) => Ok(messages
-                .into_iter()
-                .map(|(peer_id, payload)| (peer_id, PyBytes::new(py, &payload).unbind()))
-                .collect()),
-            Ok(Err(err)) => Err(PyRuntimeError::new_err(err)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Cancel the pending local batch; late messages will be treated as obsolete.
-                let _ = commands.send(Command::CancelExchange { exchange_id });
-                Err(PyTimeoutError::new_err(format!(
-                    "Exchange {exchange_id} timed out"
-                )))
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(PyRuntimeError::new_err(
-                "Network worker stopped during exchange",
-            )),
+    /// Encode metadata and a contiguous uint8 NumPy view in one Rust allocation.
+    /// Python no longer constructs a large intermediate bytes object.
+    #[pyo3(signature = (exchange_id, meta, payload, timeout=None))]
+    pub fn exchange_array(
+        &self,
+        py: Python<'_>,
+        exchange_id: u64,
+        meta: &Bound<'_, PyBytes>,
+        payload: PyReadonlyArray1<'_, u8>,
+        timeout: Option<f64>,
+    ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
+        let meta = meta.as_bytes();
+        let payload = payload.as_slice().map_err(|_| {
+            PyValueError::new_err("payload must be a contiguous 1-D uint8 NumPy array")
+        })?;
+        let size = message::HEADER_SIZE
+            .checked_add(4)
+            .and_then(|size| size.checked_add(meta.len()))
+            .and_then(|size| size.checked_add(payload.len()))
+            .ok_or_else(|| PyValueError::new_err("Message too large"))?;
+        if size > DATA_MAX_SIZE {
+            return Err(PyValueError::new_err("Message too large"));
         }
+        let encoded = message::encode_state(exchange_id, meta, payload)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        self.exchange_encoded(py, exchange_id, encoded, timeout)
     }
 
     pub fn close(&mut self, py: Python<'_>) -> PyResult<()> {

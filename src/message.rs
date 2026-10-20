@@ -23,6 +23,27 @@ pub fn encode(exchange_id: u64, payload: &[u8]) -> Bytes {
     buffer.freeze()
 }
 
+/// Encode the NumPy adapter's state directly into a single DATA allocation.
+/// DATA payload: 4-byte metadata length | metadata | contiguous array bytes.
+/// The wire format is identical to encode(id, prepacked_state_bytes).
+pub fn encode_state(exchange_id: u64, meta: &[u8], payload: &[u8]) -> io::Result<Bytes> {
+    let meta_len = u32::try_from(meta.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Metadata exceeds u32"))?;
+    let capacity = HEADER_SIZE
+        .checked_add(4)
+        .and_then(|size| size.checked_add(meta.len()))
+        .and_then(|size| size.checked_add(payload.len()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Message too large"))?;
+
+    let mut buffer = BytesMut::with_capacity(capacity);
+    buffer.put_u8(TYPE_DATA);
+    buffer.put_u64(exchange_id);
+    buffer.put_u32(meta_len);
+    buffer.extend_from_slice(meta);
+    buffer.extend_from_slice(payload);
+    Ok(buffer.freeze())
+}
+
 /// Encode a compact ACK frame (no payload).
 pub fn encode_ack(exchange_id: u64) -> Bytes {
     let mut buffer = BytesMut::with_capacity(HEADER_SIZE);
@@ -102,5 +123,39 @@ mod tests {
         let mut unknown = encode_ack(10).to_vec();
         unknown[0] = 255;
         assert!(decode(Bytes::from(unknown)).is_err());
+    }
+
+    #[test]
+    fn test_encode_state_compatible_with_existing_wire_format() {
+        let meta = b"meta";
+        let payload = b"\x00\x01\xff";
+        let encoded = encode_state(42, meta, payload).unwrap();
+
+        let mut old_payload = Vec::new();
+        old_payload.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+        old_payload.extend_from_slice(meta);
+        old_payload.extend_from_slice(payload);
+
+        assert_eq!(encoded, encode(42, &old_payload));
+        match decode(encoded).unwrap() {
+            Message::Data {
+                exchange_id,
+                payload,
+            } => {
+                assert_eq!(exchange_id, 42);
+                assert_eq!(payload.as_ref(), old_payload.as_slice());
+            }
+            _ => panic!("expected DATA"),
+        }
+    }
+
+    #[test]
+    fn test_encode_state_empty_meta_and_array() {
+        let encoded = encode_state(0, b"", b"").unwrap();
+        assert_eq!(encoded.len(), HEADER_SIZE + 4);
+        match decode(encoded).unwrap() {
+            Message::Data { payload, .. } => assert_eq!(payload.as_ref(), &[0, 0, 0, 0]),
+            _ => panic!("expected DATA"),
+        }
     }
 }
