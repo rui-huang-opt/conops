@@ -29,7 +29,6 @@ def main() -> None:
     parser.add_argument("--n_iter", type=int, default=100)
     parser.add_argument("--n_state", type=int, default=1000000)
     parser.add_argument("--interval", type=float, default=0.1)
-    parser.add_argument("--timeout", type=float, default=30.0)
     args = parser.parse_args(namespace=Args())
 
     network = Network(
@@ -65,13 +64,11 @@ def main() -> None:
             x = x - 0.45 * network.laplacian(
                 exchange_id=n_warmup + 2 * k,
                 state=x,
-                timeout=args.timeout,
             )
 
             y = y - 0.2 * network.laplacian(
                 exchange_id=n_warmup + 2 * k + 1,
                 state=y,
-                timeout=args.timeout,
             )
 
         elapsed = time.perf_counter() - before
