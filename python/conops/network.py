@@ -18,25 +18,33 @@ _META_LENGTH = struct.Struct("!I")
 
 
 class Network:
-    """Synchronous neighbor exchanges of NumPy arrays over the Rust backend.
+    """
+    Synchronous neighbor exchanges of NumPy arrays over the Rust backend.
 
     Parameters
     ----------
     node_id : str
         Unique identifier for this node within the group.
+
     neighbors : Mapping[str, float]
-        Fixed neighbor IDs and their weights, as used by ``weighted_mix``.
+        Fixed neighbor IDs and their associated weights.
+
+    group_id : str, optional
+        Group identifier used to isolate independent network instances.
+        Defaults to ``"default"``.
+
     port : int, optional
-        Local TCP listening port. Defaults to 0 for automatic port assignment.
-    group_id : str
-        mDNS discovery group used to isolate independent experiments.
-    transform : Transform | None
-        Unchanged ConOps transformation protocol. Defaults to ``Identity``.
+        Local TCP listening port. Defaults to ``0`` for automatic assignment.
+
+    transform : Transform | None, optional
+        Transformation applied to exchanged states. Defaults to ``Identity``.
 
     Notes
     -----
-    Every exchange operation requires an explicit, monotonically increasing
-    ``exchange_id``. Network does not manage algorithm rounds or iteration IDs.
+    Each exchange requires a monotonically increasing ``exchange_id``
+    to match messages across neighboring nodes. The network handles
+    connection recovery and message replay but does not manage
+    algorithm iterations or synchronization logic.
     """
 
     def __init__(
@@ -44,13 +52,14 @@ class Network:
         node_id: str,
         neighbors: Mapping[str, float],
         *,
-        port: int = 0,
         group_id: str = "default",
+        port: int = 0,
         transform: Transform | None = None,
     ) -> None:
         self._node_id = node_id
         self._neighbors = dict(neighbors)
         self._transform = transform if transform is not None else Identity()
+
         self._core = CoreNetwork(
             node_id,
             port,

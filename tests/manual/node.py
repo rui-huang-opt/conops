@@ -28,6 +28,7 @@ def main() -> None:
     parser.add_argument("--n_iter", type=int, default=100)
     parser.add_argument("--n_state", type=int, default=1000000)
     parser.add_argument("--interval", type=float, default=0.1)
+
     args = parser.parse_args(namespace=Args())
 
     network = Network(

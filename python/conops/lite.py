@@ -14,7 +14,7 @@ from .transform import Transform, Identity
 logger = getLogger(__name__)
 
 
-class FastNetwork:
+class LiteNetwork:
     """
     Lightweight synchronous communication interface for fast state exchange.
 
@@ -38,8 +38,8 @@ class FastNetwork:
     neighbors : dict[str, float]
         Mapping from neighbor node IDs to their associated edge weights.
 
-    namespace : str, optional
-        Namespace used to isolate independent network instances.
+    group_id : str, optional
+        Group identifier used to isolate independent network instances.
         Defaults to ``"default"``.
 
     transform : Transform | None, optional
@@ -62,13 +62,13 @@ class FastNetwork:
         node_id: str,
         neighbors: dict[str, float],
         *,
-        namespace: str = "default",
+        group_id: str = "default",
         transform: Transform | None = None,
         context: zmq.SyncContext | None = None,
         peer_endpoints: dict[str, str] | None = None,
     ) -> None:
         self._node_id = node_id
-        self._namespace = namespace
+        self._group_id = group_id
         self._transform = transform if transform is not None else Identity()
 
         if context is None:
@@ -151,7 +151,7 @@ class FastNetwork:
 
         try:
             pyre_node.set_header("port", str(port))
-            pyre_node.join(self._namespace)
+            pyre_node.join(self._group_id)
             pyre_node.start()
 
             endpoints = self._discover_neighbors(pyre_node)
@@ -208,8 +208,8 @@ class FastNetwork:
             if event != "JOIN":
                 continue
 
-            namespace = msg[3].decode("utf-8")
-            if namespace != self._namespace:
+            group_id = msg[3].decode("utf-8")
+            if group_id != self._group_id:
                 continue
 
             info = pending.pop(peer_uuid_bytes, None)

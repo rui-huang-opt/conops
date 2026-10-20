@@ -1,5 +1,5 @@
 from .graph import Graph
 from .network import Network
-from .fast import FastNetwork
+from .lite import LiteNetwork
 
-__all__ = ["Graph", "Network", "FastNetwork"]
+__all__ = ["Graph", "Network", "LiteNetwork"]

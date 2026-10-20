@@ -4,7 +4,7 @@ import logging
 
 import numpy.random as npr
 
-from conops import Graph, FastNetwork
+from conops import Graph, LiteNetwork
 
 logging.basicConfig(level=logging.INFO)
 
@@ -29,7 +29,7 @@ def main() -> None:
     parser.add_argument("--interval", type=float, default=0.1)
     args = parser.parse_args(namespace=Args())
 
-    network = FastNetwork(node_id=args.node_id, neighbors=graph[args.node_id])
+    network = LiteNetwork(node_id=args.node_id, neighbors=graph[args.node_id])
 
     try:
         npr.seed(int(args.node_id))  # Ensure reproducibility for each node

@@ -116,3 +116,62 @@ impl Discovery {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    #[ignore = "requires local mDNS multicast support"]
+    async fn test_discovery() {
+        let pid = std::process::id();
+
+        let a_id = format!("test-a-{pid}");
+        let b_id = format!("test-b-{pid}");
+        let namespace = format!("test-namespace-{pid}");
+
+        let mut a = Discovery::new(&a_id, 5000, &namespace).unwrap();
+        let mut b = Discovery::new(&b_id, 5001, &namespace).unwrap();
+
+        // Both nodes should discover each other.
+        let (found_b, found_a) = tokio::join!(
+            timeout(Duration::from_secs(15), async {
+                loop {
+                    match a.next().await {
+                        Some(DiscoveryEvent::Found(peer)) if peer.node_id == b_id => {
+                            break peer;
+                        }
+                        Some(_) => continue,
+                        None => panic!("Discovery A stopped unexpectedly"),
+                    }
+                }
+            }),
+            timeout(Duration::from_secs(15), async {
+                loop {
+                    match b.next().await {
+                        Some(DiscoveryEvent::Found(peer)) if peer.node_id == a_id => {
+                            break peer;
+                        }
+                        Some(_) => continue,
+                        None => panic!("Discovery B stopped unexpectedly"),
+                    }
+                }
+            }),
+        );
+
+        let found_b = found_b.expect("A did not discover B");
+        let found_a = found_a.expect("B did not discover A");
+
+        assert!(!found_b.addresses.is_empty());
+        assert!(!found_a.addresses.is_empty());
+
+        assert!(found_b.addresses.iter().all(|addr| addr.port() == 5001));
+        assert!(found_a.addresses.iter().all(|addr| addr.port() == 5000));
+
+        a.close().unwrap();
+        b.close().unwrap();
+    }
+}
