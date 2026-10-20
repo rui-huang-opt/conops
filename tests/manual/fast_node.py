@@ -25,7 +25,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("node_id", type=str, choices=NODES)
     parser.add_argument("--n_iter", type=int, default=100)
-    parser.add_argument("--n_state", type=int, default=3)
+    parser.add_argument("--n_state", type=int, default=1000000)
     parser.add_argument("--interval", type=float, default=0.1)
     args = parser.parse_args(namespace=Args())
 
@@ -38,17 +38,26 @@ def main() -> None:
 
         k = 0
 
+        n_warmup = 10
+        for _ in range(n_warmup):
+            network.exchange(x)
+
+        before = time.monotonic()
+
         while k < args.n_iter - 1:
-            print(f"[{args.node_id}] - Round {k}: x = {x}, y = {y}", flush=True)
+            # print(f"[{args.node_id}] - Round {k}: x = {x}, y = {y}", flush=True)
 
             x = x - network.laplacian(x) * 0.45
             y = y - network.laplacian(y) * 0.2
 
             k = k + 1
 
-            time.sleep(args.interval)
+        elapsed = time.monotonic() - before
 
-        print(f"[{args.node_id}] - Round {k}: x = {x}, y = {y}", flush=True)
+        print(
+            f"[{args.node_id}] - Final: x = {x}, y = {y} (elapsed {elapsed:.3f}s)",
+            flush=True,
+        )
 
     finally:
         network.close()
