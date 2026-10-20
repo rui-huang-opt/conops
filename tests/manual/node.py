@@ -20,7 +20,6 @@ class Args(argparse.Namespace):
     n_iter: int
     n_state: int
     interval: float
-    timeout: float
 
 
 def main() -> None:
@@ -39,7 +38,7 @@ def main() -> None:
 
     try:
         network.start()
-        network.wait_connected(timeout=args.timeout)
+        network.wait_connected()
 
         print(
             f"[{args.node_id}] Connected: {network.peers()}",
@@ -52,11 +51,7 @@ def main() -> None:
 
         n_warmup = 10
         for exchange_id in range(n_warmup):
-            network.exchange(
-                exchange_id,
-                x,
-                timeout=args.timeout,
-            )
+            network.exchange(exchange_id, x)
 
         before = time.perf_counter()
 

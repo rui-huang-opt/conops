@@ -863,7 +863,7 @@ impl CoreNetwork {
             .commands
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Node is not started"))?;
-        let (reply, result_rx) = mpsc::channel();
+        let (reply, mut result_rx) = mpsc::channel();
         commands
             .send(Command::Exchange {
                 exchange_id,
@@ -872,12 +872,39 @@ impl CoreNetwork {
             })
             .map_err(|_| PyRuntimeError::new_err("Network worker has stopped"))?;
 
-        let result = py.detach(move || match deadline {
-            Some(duration) => result_rx.recv_timeout(duration),
-            None => result_rx
-                .recv()
-                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-        });
+        // Periodically check Python signals so Ctrl+C can interrupt exchange().
+        let end = deadline.map(|duration| Instant::now() + duration);
+
+        let result = loop {
+            let wait = match end {
+                Some(end) => end
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100)),
+                None => Duration::from_millis(100),
+            };
+
+            let rx = &mut result_rx;
+
+            match py.detach(move || rx.recv_timeout(wait)) {
+                Ok(value) => break Ok(value),
+
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(mpsc::RecvTimeoutError::Disconnected);
+                }
+
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Process Ctrl+C and other Python signals.
+                    if let Err(err) = py.check_signals() {
+                        let _ = commands.send(Command::CancelExchange { exchange_id });
+                        return Err(err);
+                    }
+
+                    if end.is_some_and(|end| Instant::now() >= end) {
+                        break Err(mpsc::RecvTimeoutError::Timeout);
+                    }
+                }
+            }
+        };
         match result {
             Ok(Ok(messages)) => {
                 let mut received = HashMap::with_capacity(messages.len());
@@ -1051,15 +1078,20 @@ impl CoreNetwork {
         };
 
         loop {
+            py.check_signals()?;
+
             let connected: HashSet<String> = self.peers(py)?.into_iter().collect();
+
             if expected.is_subset(&connected) {
                 return Ok(());
             }
+
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(PyTimeoutError::new_err(
                     "Not all neighbors connected before timeout",
                 ));
             }
+
             py.detach(|| thread::sleep(Duration::from_millis(50)));
         }
     }
