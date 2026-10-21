@@ -1,6 +1,5 @@
 import struct
 from collections.abc import KeysView, Mapping
-from typing import cast
 from urllib.parse import urlsplit
 
 import msgspec
