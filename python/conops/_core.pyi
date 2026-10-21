@@ -24,4 +24,10 @@ class CoreNetwork:
         payload: NDArray[np.uint8],
         timeout: float | None = None,
     ) -> dict[str, memoryview]: ...
+    def neighborwise_exchange_array(
+        self,
+        key: bytes,
+        states: dict[str, tuple[bytes, NDArray[np.uint8]]],
+        timeout: float | None = None,
+    ) -> dict[str, memoryview]: ...
     def close(self) -> None: ...

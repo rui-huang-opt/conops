@@ -247,18 +247,34 @@ class Network:
         )
         return {peer_id: self._unpack(data) for peer_id, data in incoming.items()}
 
-    def exchange_as_array(
+    def neighborwise_exchange(
         self,
-        state: NDArray,
+        state_map: Mapping[str, NDArray],
         *,
         key: ExchangeKey,
         timeout: float | None = None,
-    ) -> NDArray:
-        """Return neighbors' states stacked in the order of ``neighbors``."""
-        received = self.exchange(state, key=key, timeout=timeout)
-        if not self._neighbors:
-            return np.empty((0, *state.shape), dtype=state.dtype)
-        return np.stack([received[peer_id] for peer_id in self._neighbors], axis=0)
+    ) -> dict[str, NDArray]:
+        """Exchange a different state with each neighbor under the same key."""
+        expected = set(self._neighbors)
+        provided = set(state_map)
+        if provided != expected:
+            missing = expected - provided
+            extra = provided - expected
+            raise ValueError(
+                "state_map must cover exactly the configured neighbors; "
+                f"missing={sorted(missing)}, extra={sorted(extra)}"
+            )
+
+        encoded_key = _encode_exchange_key(key)
+        prepared = {
+            peer_id: self._prepare(state_map[peer_id]) for peer_id in self._neighbors
+        }
+        incoming = self._core.neighborwise_exchange_array(
+            key=encoded_key,
+            states=prepared,
+            timeout=timeout,
+        )
+        return {peer_id: self._unpack(data) for peer_id, data in incoming.items()}
 
     def laplacian(
         self,

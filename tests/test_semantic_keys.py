@@ -9,20 +9,22 @@ import socket
 import time
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
+from typing import Protocol
 
 import numpy as np
 
 from conops import Network
 
+
+class BarrierLike(Protocol):
+    def wait(self, timeout: float | None = None) -> int: ...
+
+
 KEYS = [(20, "x"), (2, "gradient"), "last", 7]
-NEIGHBORS = {
-    "1": {"2": 0.5},
-    "2": {"1": 0.5, "3": 0.5},
-    "3": {"2": 0.5},
-}
+NEIGHBORS = {"1": {"2": 0.5}, "2": {"1": 0.5, "3": 0.5}, "3": {"2": 0.5}}
 
 
-def run_node(node_id: str, endpoints: dict[str, str]) -> bool:
+def run_node(node_id: str, endpoints: dict[str, str], barrier: BarrierLike) -> bool:
     neighbors = NEIGHBORS[node_id]
     local_endpoints = {peer: endpoints[peer] for peer in (node_id, *neighbors)}
     network = Network(
@@ -55,6 +57,7 @@ def run_node(node_id: str, endpoints: dict[str, str]) -> bool:
         else:
             raise AssertionError("A completed exchange key was reused")
 
+        barrier.wait(timeout=30)
         return True
     finally:
         network.close()
@@ -72,19 +75,26 @@ def find_ports(n: int) -> list[int]:
             sock.close()
 
 
-def main() -> None:
+def test_semantic_keys() -> None:
     endpoints = {
         node_id: f"tcp://127.0.0.1:{port}"
         for node_id, port in zip(NEIGHBORS, find_ports(len(NEIGHBORS)))
     }
-    with ProcessPoolExecutor(
-        max_workers=len(NEIGHBORS),
-        mp_context=get_context("spawn"),
-    ) as executor:
-        tasks = [executor.submit(run_node, node_id, endpoints) for node_id in NEIGHBORS]
-        assert all(task.result(timeout=60) for task in tasks)
-    print("PASS: unordered semantic keys and early DATA in three processes")
+
+    ctx = get_context("spawn")
+    with ctx.Manager() as manager:
+        barrier = manager.Barrier(len(NEIGHBORS))
+
+        with ProcessPoolExecutor(
+            max_workers=len(NEIGHBORS),
+            mp_context=ctx,
+        ) as executor:
+            tasks = [
+                executor.submit(run_node, node_id, endpoints, barrier)
+                for node_id in NEIGHBORS
+            ]
+            assert all(task.result(timeout=60) for task in tasks)
 
 
 if __name__ == "__main__":
-    main()
+    test_semantic_keys()

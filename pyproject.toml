@@ -5,7 +5,7 @@ build-backend = "maturin"
 
 [project]
 name = "conops"
-version = "0.5.0"
+version = "0.5.1"
 description = "A Python and Rust package for distributed consensus and optimization."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,8 +20,13 @@ dependencies = [
 
 [project.optional-dependencies]
 examples = ["matplotlib>=3.10.3"]
+test = ["pytest>=8.0"]
 
 [tool.maturin]
 python-source = "python"
 module-name = "conops._core"
 bindings = "pyo3"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

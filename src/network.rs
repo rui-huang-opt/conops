@@ -14,7 +14,7 @@ use pyo3::{
     exceptions::{PyBufferError, PyRuntimeError, PyTimeoutError, PyValueError},
     ffi,
     prelude::*,
-    types::{PyBytes, PyMemoryView},
+    types::{PyBytes, PyDict, PyMemoryView, PyTuple},
 };
 use tokio::{
     net::{TcpListener, TcpStream, tcp::OwnedReadHalf, tcp::OwnedWriteHalf},
@@ -150,12 +150,27 @@ enum Command {
     },
     Exchange {
         key: Bytes,
-        data: Bytes, // already encoded with its key
+        data: ExchangeData,
         reply: ExchangeReply,
     },
     CancelExchange {
         key: Bytes,
     },
+}
+
+// Broadcast shares one DATA buffer; neighborwise keeps one DATA buffer per peer.
+enum ExchangeData {
+    Broadcast(Bytes),
+    Neighborwise(HashMap<String, Bytes>),
+}
+
+impl ExchangeData {
+    fn for_peer(&self, peer_id: &str) -> Option<&Bytes> {
+        match self {
+            Self::Broadcast(frame) => Some(frame),
+            Self::Neighborwise(frames) => frames.get(peer_id),
+        }
+    }
 }
 
 struct Established {
@@ -648,6 +663,16 @@ async fn run_network(
                             }
                         }
 
+                        // A neighborwise call must supply exactly one DATA frame per connected peer.
+                        if let ExchangeData::Neighborwise(frames) = &data {
+                            if frames.len() != peers.len()
+                                || frames.keys().any(|peer_id| !peers.contains_key(peer_id))
+                            {
+                                let _ = reply.send(Err("Neighborwise states must match connected peers".into()));
+                                continue;
+                            }
+                        }
+
                         let mut batch = Batch::new(key.clone(), peers.keys().cloned().collect());
 
                         // Reuse messages that arrived before this node entered the exchange.
@@ -664,9 +689,10 @@ async fn run_network(
                         let mut permits = Vec::with_capacity(peers.len());
                         if error.is_none() {
                             for (peer_id, peer) in &peers {
+                                let frame = data.for_peer(peer_id).expect("checked neighborwise peers");
                                 if let Err(err) = unacked.entry(peer_id.clone())
                                     .or_default().check_capacity(
-                                        &key, data.len(), config.max_unacked_bytes,
+                                        &key, frame.len(), config.max_unacked_bytes,
                                     )
                                 {
                                     error = Some(format!("Cannot retain message for {peer_id}: {err}"));
@@ -686,11 +712,12 @@ async fn run_network(
                             let _ = reply.send(Err(reason));
                         } else {
                             // Cache before queuing: a queued write is NOT proof of delivery.
-                            // Clone(Bytes) shares the allocation across all neighbors.
+                            // Broadcast clones share one allocation; neighborwise frames differ.
                             for (peer_id, permit) in permits {
+                                let frame = data.for_peer(&peer_id).expect("checked neighborwise peers");
                                 unacked.entry(peer_id).or_default()
-                                    .insert(key.clone(), data.clone());
-                                permit.send(data.clone());
+                                    .insert(key.clone(), frame.clone());
+                                permit.send(frame.clone());
                             }
                             pending = Some(PendingExchange { batch, reply });
                             complete_exchange(&mut pending, &mut completed);
@@ -901,7 +928,7 @@ impl CoreNetwork {
         &self,
         py: Python<'_>,
         key: Bytes,
-        encoded: Bytes,
+        data: ExchangeData,
         timeout: Option<f64>,
     ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
         let deadline = match timeout {
@@ -924,7 +951,7 @@ impl CoreNetwork {
         commands
             .send(Command::Exchange {
                 key: key.clone(),
-                data: encoded,
+                data,
                 reply,
             })
             .map_err(|_| PyRuntimeError::new_err("Network worker has stopped"))?;
@@ -1224,7 +1251,82 @@ impl CoreNetwork {
         }
         let encoded = message::encode_state(key, meta, payload)
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        self.exchange_encoded(py, Bytes::copy_from_slice(key), encoded, timeout)
+        self.exchange_encoded(
+            py,
+            Bytes::copy_from_slice(key),
+            ExchangeData::Broadcast(encoded),
+            timeout,
+        )
+    }
+
+    /// Send a different NumPy state to each peer under the same exchange key.
+    #[pyo3(signature = (key, states, timeout=None))]
+    pub fn neighborwise_exchange_array(
+        &self,
+        py: Python<'_>,
+        key: &Bound<'_, PyBytes>,
+        states: &Bound<'_, PyDict>,
+        timeout: Option<f64>,
+    ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
+        let key = key.as_bytes();
+        if let Some(expected) = &self.neighbors {
+            if states.len() != expected.len() {
+                return Err(PyValueError::new_err(
+                    "Neighborwise states must match configured neighbors",
+                ));
+            }
+        }
+
+        let mut frames = HashMap::with_capacity(states.len());
+        for (peer_id, state) in states.iter() {
+            let peer_id: String = peer_id.extract()?;
+            if self
+                .neighbors
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&peer_id))
+            {
+                return Err(PyValueError::new_err(format!(
+                    "Unexpected neighbor: {peer_id}"
+                )));
+            }
+
+            let pair = state.cast::<PyTuple>().map_err(|_| {
+                PyValueError::new_err("Neighborwise values must be (metadata, payload) pairs")
+            })?;
+            if pair.len() != 2 {
+                return Err(PyValueError::new_err(
+                    "Neighborwise values must contain two items",
+                ));
+            }
+            let meta_obj = pair.get_item(0)?;
+            let meta = meta_obj.cast::<PyBytes>()?;
+            let payload_obj = pair.get_item(1)?;
+            let payload = payload_obj.extract::<PyReadonlyArray1<'_, u8>>()?;
+            let payload = payload.as_slice().map_err(|_| {
+                PyValueError::new_err("payload must be a contiguous 1-D uint8 NumPy array")
+            })?;
+
+            let size = message::HEADER_SIZE
+                .checked_add(key.len())
+                .and_then(|size| size.checked_add(4))
+                .and_then(|size| size.checked_add(meta.as_bytes().len()))
+                .and_then(|size| size.checked_add(payload.len()))
+                .ok_or_else(|| PyValueError::new_err("Message too large"))?;
+            if size > self.config.max_message_size {
+                return Err(PyValueError::new_err("Message too large"));
+            }
+
+            let frame = message::encode_state(key, meta.as_bytes(), payload)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            frames.insert(peer_id, frame);
+        }
+
+        self.exchange_encoded(
+            py,
+            Bytes::copy_from_slice(key),
+            ExchangeData::Neighborwise(frames),
+            timeout,
+        )
     }
 
     pub fn close(&mut self, py: Python<'_>) -> PyResult<()> {
@@ -1359,5 +1461,25 @@ mod ack_tests {
             .validate()
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod neighborwise_tests {
+    use super::*;
+
+    #[test]
+    fn exchange_data_selects_per_peer_frames() {
+        let broadcast = ExchangeData::Broadcast(Bytes::from_static(b"same"));
+        assert_eq!(broadcast.for_peer("A").unwrap().as_ref(), b"same");
+        assert_eq!(broadcast.for_peer("B").unwrap().as_ref(), b"same");
+
+        let mut frames = HashMap::new();
+        frames.insert("A".into(), Bytes::from_static(b"to A"));
+        frames.insert("B".into(), Bytes::from_static(b"to B"));
+        let neighborwise = ExchangeData::Neighborwise(frames);
+        assert_eq!(neighborwise.for_peer("A").unwrap().as_ref(), b"to A");
+        assert_eq!(neighborwise.for_peer("B").unwrap().as_ref(), b"to B");
+        assert!(neighborwise.for_peer("C").is_none());
     }
 }

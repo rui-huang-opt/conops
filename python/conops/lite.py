@@ -333,43 +333,6 @@ class LiteNetwork:
 
         return neighbor_states
 
-    def exchange_as_array(
-        self,
-        state: NDArray,
-        *,
-        key: object | None = None,
-    ) -> NDArray:
-        """
-        Exchanges the given state with all neighbor nodes and returns their states as a stacked array.
-
-        Note: Using this method will add an extra copy of the neighbor states in memory compared to the `exchange` method.
-        This is because the states are first received as individual memory buffers and then stacked into a single array.
-
-        Args:
-            state (NDArray[np.float64]): The state array to exchange with neighbors.
-
-            key (object | None, optional): Accepted for API compatibility with Network,
-            but ignored by LiteNetwork. Defaults to None.
-
-        Returns:
-            NDArray[np.float64]: A 2D array where each row corresponds to a neighbor's received state array.
-        """
-        if self._out_socket is None:
-            raise RuntimeError("FastNetwork is not bound")
-
-        meta, payload = self._transform.encode(state)
-        payload = np.ascontiguousarray(payload)
-        for j_bytes in self._neighbor_id_bytes:
-            msgs = [j_bytes, meta, payload]
-            self._out_socket.send_multipart(msgs, copy=False)
-
-        neighbor_states: list[NDArray[np.float64]] = []
-        for j in self._neighbors:
-            meta, payload = self._dealers[j].recv_multipart()
-            neighbor_states.append(self._transform.decode(meta, payload))
-
-        return np.stack(neighbor_states, axis=0)
-
     def laplacian(self, state: NDArray, *, key: object | None = None) -> NDArray:
         """
         Computes the Laplacian of the given state vector based on the states of neighboring nodes.

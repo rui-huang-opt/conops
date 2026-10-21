@@ -51,8 +51,8 @@ jobs:
       - name: Install Python package
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
+          python -m pip install -e ".[test]"
 
-      - name: Test Python integration
+      - name: Test Python
         timeout-minutes: 5
-        run: python tests/test_semantic_keys.py
+        run: python -m pytest -v

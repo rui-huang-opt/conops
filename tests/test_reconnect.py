@@ -1,16 +1,16 @@
 """
-Test ConOps TCP reconnect and unacknowledged DATA replay.
+Test ConOps TCP reconnection and unacknowledged DATA replay.
 
-Two worker processes communicate through a local TCP proxy. At exchange ID 3,
-the proxy consumes (but does not forward) both DATA frames, closes the TCP
-connection, and then permits the Rust backend to reconnect and replay them.
+Two worker processes communicate through a local TCP proxy. At exchange key 3,
+the proxy drops both DATA frames, closes the TCP connection, and allows the
+Rust backend to reconnect and replay them.
 
-Run: python test_reconnect.py
-No root privileges or Rust source changes are needed.
+Run: python -m pytest -v tests/test_reconnect.py
 """
 
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
+from typing import Protocol
 import socket
 import struct
 import threading
@@ -20,6 +20,11 @@ import msgspec
 import numpy as np
 
 from conops import Network
+
+
+class BarrierLike(Protocol):
+    def wait(self, timeout: float | None = None) -> int: ...
+
 
 N_EXCHANGES = 7
 CUT_EXCHANGE = 3
@@ -183,7 +188,11 @@ class FaultProxy:
             self._close_pair(pair)
 
 
-def worker(node_id: str, endpoints: dict[str, str]) -> tuple[str, list[float]]:
+def worker(
+    node_id: str,
+    endpoints: dict[str, str],
+    barrier: BarrierLike,
+) -> tuple[str, list[float]]:
     peer_id = "2" if node_id == "1" else "1"
     network = Network(
         node_id=node_id,
@@ -206,12 +215,13 @@ def worker(node_id: str, endpoints: dict[str, str]) -> tuple[str, list[float]]:
             expected = np.array([int(peer_id), k], dtype=np.int64)
             np.testing.assert_array_equal(received[peer_id], expected)
 
+        barrier.wait(timeout=30)
         return node_id, elapsed
     finally:
         network.close()
 
 
-def main() -> None:
+def test_reconnect() -> None:
     node1_port, node2_port = available_ports()
     addr1 = f"tcp://127.0.0.1:{node1_port}"
     addr2 = f"tcp://127.0.0.1:{node2_port}"
@@ -222,15 +232,19 @@ def main() -> None:
         endpoints1 = {"1": addr1, "2": f"tcp://127.0.0.1:{proxy.port}"}
         endpoints2 = {"1": addr1, "2": addr2}
 
-        with ProcessPoolExecutor(
-            max_workers=2,
-            mp_context=get_context("spawn"),
-        ) as executor:
-            futures = [
-                executor.submit(worker, "1", endpoints1),
-                executor.submit(worker, "2", endpoints2),
-            ]
-            results = [future.result(timeout=90) for future in futures]
+        ctx = get_context("spawn")
+        with ctx.Manager() as manager:
+            barrier = manager.Barrier(2)
+
+            with ProcessPoolExecutor(
+                max_workers=2,
+                mp_context=ctx,
+            ) as executor:
+                futures = [
+                    executor.submit(worker, "1", endpoints1, barrier),
+                    executor.submit(worker, "2", endpoints2, barrier),
+                ]
+                results = [future.result(timeout=90) for future in futures]
 
         print("\nExchange latencies (seconds):")
         for node_id, times in results:
@@ -241,11 +255,6 @@ def main() -> None:
                 "The proxy did not complete the disconnect/reconnect test"
             )
 
-        print(
-            "\nPASS: TCP was interrupted; nodes reconnected and all exchanges matched."
-        )
-        print("The interrupted exchange succeeded without restarting either process.")
-
 
 if __name__ == "__main__":
-    main()
+    test_reconnect()
