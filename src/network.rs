@@ -8,6 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use log::{info, warn};
 use numpy::PyReadonlyArray1;
 use pyo3::{
     exceptions::{PyBufferError, PyRuntimeError, PyTimeoutError, PyValueError},
@@ -420,7 +421,7 @@ fn register_peer(
                 session,
             },
         );
-        println!("[{node_id}] Connected to {peer_id}");
+        info!("[{node_id}] Connected to {peer_id}");
         Ok(())
     };
     if let Some(reply) = reply {
@@ -456,7 +457,7 @@ fn disconnect_peer(
         peer.writer.abort();
         // Keep pending Batch and early data: the connection can return.
         // The Python exchange deadline still limits how long we wait.
-        println!("[{node_id}] Disconnected from {peer_id}: {reason}");
+        info!("[{node_id}] Disconnected from {peer_id}: {reason}");
     }
 }
 
@@ -503,7 +504,7 @@ async fn run_network(
         None
     };
 
-    println!("[{node_id}] Listening on 0.0.0.0:{actual_port}");
+    info!("[{node_id}] Listening on 0.0.0.0:{actual_port}");
     let _ = ready_tx.send(Ok(()));
 
     let (established_tx, mut established_rx) = async_mpsc::unbounded_channel::<ConnectEvent>();
@@ -545,13 +546,13 @@ async fn run_network(
                                         peer_id, stream, outgoing: false, reply: None,
                                     }));
                                 }
-                                Ok(Err(err)) => eprintln!("[{my_id}] HELLO failed: {err}"),
-                                Err(_) => eprintln!("[{my_id}] HELLO timed out"),
+                                Ok(Err(err)) => warn!("[{my_id}] HELLO failed: {err}"),
+                                Err(_) => warn!("[{my_id}] HELLO timed out"),
                             }
                         });
                     }
                     Err(err) => {
-                        eprintln!("[{node_id}] Accept failed: {err}");
+                        warn!("[{node_id}] Accept failed: {err}");
                         break;
                     }
                 }
@@ -735,7 +736,7 @@ async fn run_network(
                         addresses.remove(&peer_id);
                     }
                     None => {
-                        eprintln!("[{node_id}] mDNS discovery stopped");
+                        warn!("[{node_id}] mDNS discovery stopped");
                         discovery = None; // avoid a busy loop on a closed receiver
                     }
                 }
@@ -828,10 +829,10 @@ async fn run_network(
     }
     if let Some(discovery) = discovery {
         if let Err(err) = discovery.close() {
-            eprintln!("[{node_id}] Failed to stop mDNS: {err}");
+            warn!("[{node_id}] Failed to stop mDNS: {err}");
         }
     }
-    println!("[{node_id}] Stopped");
+    info!("[{node_id}] Stopped");
 }
 
 #[pyclass]
@@ -1017,8 +1018,14 @@ impl CoreNetwork {
                 .build();
             match rt {
                 Ok(rt) => rt.block_on(run_network(
-                    node_id, port, neighbors, group_id, peer_endpoints,
-                    stop_rx, command_rx, ready_tx,
+                    node_id,
+                    port,
+                    neighbors,
+                    group_id,
+                    peer_endpoints,
+                    stop_rx,
+                    command_rx,
+                    ready_tx,
                 )),
                 Err(err) => {
                     let _ = ready_tx.send(Err(err.to_string()));

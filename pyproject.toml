@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-examples = ["matplotlib>=3.10.3", "networkx>=3.4.2", "ray[default]==2.54.1"]
+examples = ["matplotlib>=3.10.3"]
 
 [tool.maturin]
 python-source = "python"

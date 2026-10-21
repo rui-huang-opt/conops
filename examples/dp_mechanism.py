@@ -1,5 +1,9 @@
+from concurrent.futures import ProcessPoolExecutor
+
+import matplotlib.pyplot as plt
 import numpy as np
-import ray
+import numpy.random as npr
+import numpy.typing as npt
 
 from conops import Graph, Network
 from conops.transform import DPMechanism
@@ -20,51 +24,42 @@ W = np.eye(N_NODES) - L * 0.45
 
 graph = Graph.from_mixing_matrix(W)
 
-import numpy.typing as npt
-import numpy.random as npr
 
-
-@ray.remote
 def consensus(
-    idx: str, neighbors: dict[str, float], n_state: int, n_iter: int = 50
+    idx: str,
+    neighbors: dict[str, float],
+    n_state: int,
+    n_iter: int = 50,
 ) -> npt.NDArray[np.float64]:
     x = np.zeros((n_iter, n_state))
-    npr.seed(int(idx))  # Ensure reproducibility for each node
+    npr.seed(int(idx))
     x[0] = npr.uniform(-100.0, 100.0, n_state)
 
-    transform = DPMechanism(epsilon=1.0, sensitivity=1.0)
-    network = Network(node_id=idx, neighbors=neighbors, transform=transform)
-
-    network.start()
+    network = Network(
+        node_id=idx,
+        neighbors=neighbors,
+        transform=DPMechanism(epsilon=1.0, sensitivity=1.0),
+    )
 
     try:
-        k = network.round_id
+        network.start()
+        network.wait_connected(timeout=30)
 
-        while k < n_iter - 1:
-            x[k + 1] = x[k] - network.laplacian(x[k]) * 0.45
-
-            k = network.next_round()
-
+        for k in range(n_iter - 1):
+            x[k + 1] = x[k] - 0.45 * network.laplacian(exchange_id=k, state=x[k])
     finally:
-        network.stop()
+        network.close()
 
     return x
 
 
 def main() -> None:
-    ray.init()
-
-    try:
+    with ProcessPoolExecutor(max_workers=N_NODES) as executor:
         tasks = [
-            consensus.remote(str(i + 1), graph[str(i + 1)], N_STATE)
+            executor.submit(consensus, str(i + 1), graph[str(i + 1)], N_STATE)
             for i in range(N_NODES)
         ]
-
-        node_states = [ray.get(task) for task in tasks]
-    finally:
-        ray.shutdown()
-
-    import matplotlib.pyplot as plt
+        node_states = [task.result() for task in tasks]
 
     _, ax = plt.subplots()
 
@@ -74,11 +69,12 @@ def main() -> None:
         states = node_states[i]
         for j in range(N_STATE):
             (line,) = ax.plot(states[:, j], color=colors[i])
-            line.set_label(f"Node {i + 1}") if j == 0 else None
+            if j == 0:
+                line.set_label(f"Node {i + 1}")
 
     ax.set_xlabel("Iteration")
     ax.set_ylabel("State Value")
-    ax.set_title(f"Gossip Algorithm States for {N_NODES} Nodes")
+    ax.set_title(f"Noisy Gossip Algorithm States for {N_NODES} Nodes")
     ax.legend()
     ax.grid()
 

@@ -1,11 +1,11 @@
-import numpy as np
-import numpy.typing as npt
-import numpy.random as npr
-import matplotlib.pyplot as plt
-import ray
+from concurrent.futures import ProcessPoolExecutor
 
-from conops import Graph
-from conops.network import Network
+import matplotlib.pyplot as plt
+import numpy as np
+import numpy.random as npr
+import numpy.typing as npt
+
+from conops import Graph, Network
 
 N_STATE = 3
 
@@ -15,52 +15,35 @@ EDGES = [("1", "2"), ("2", "3"), ("3", "4"), ("4", "5"), ("5", "1")]
 graph = Graph(NODES, EDGES)
 
 
-@ray.remote(num_cpus=1)
 def consensus(
     idx: str,
     neighbors: dict[str, float],
     n_state: int,
     n_iter: int = 50,
-) -> "npt.NDArray[np.float64]":
-    network = Network(
-        node_id=idx,
-        neighbors=neighbors,
-    )
+) -> npt.NDArray[np.float64]:
+    x = np.zeros((n_iter, n_state))
 
-    network.start()
+    npr.seed(int(idx))
+    x[0] = npr.uniform(-100.0, 100.0, n_state)
+
+    network = Network(node_id=idx, neighbors=neighbors)
 
     try:
-        x = np.zeros((n_iter, n_state))
+        network.start()
+        network.wait_connected(timeout=30)
 
-        npr.seed(int(idx))
-        x[0] = npr.uniform(-100.0, 100.0, n_state)
-
-        k = network.round_id
-
-        while k < n_iter - 1:
-            x[k + 1] = x[k] - network.laplacian(x[k]) * 0.45
-
-            k = network.next_round()
-
+        for k in range(n_iter - 1):
+            x[k + 1] = x[k] - 0.45 * network.laplacian(exchange_id=k, state=x[k])
     finally:
-        network.stop()
+        network.close()
 
     return x
 
 
 def main() -> None:
-    ray.init()
-
-    try:
-        tasks = [
-            consensus.remote(str(i + 1), graph[str(i + 1)], N_STATE)
-            for i in range(graph.num_nodes)
-        ]
-
-        node_states = ray.get(tasks)
-
-    finally:
-        ray.shutdown()
+    with ProcessPoolExecutor(max_workers=graph.num_nodes) as executor:
+        tasks = [executor.submit(consensus, idx, graph[idx], N_STATE) for idx in NODES]
+        node_states = [task.result() for task in tasks]
 
     _, ax = plt.subplots()
 

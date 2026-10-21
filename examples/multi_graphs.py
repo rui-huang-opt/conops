@@ -1,15 +1,11 @@
-import logging
+from concurrent.futures import ProcessPoolExecutor
 
-import ray
-
+import matplotlib.pyplot as plt
 import numpy as np
 import numpy.random as npr
 import numpy.typing as npt
-import matplotlib.pyplot as plt
 
 from conops import Graph, Network
-
-logging.basicConfig(level=logging.INFO)
 
 N_STATE = 3
 
@@ -23,54 +19,46 @@ ring = Graph(NODES, RING_EDGES)
 star = Graph(NODES, STAR_EDGES)
 
 
-@ray.remote
 def consensus(
     idx: str,
     neighbors: dict[str, float],
-    namespace: str,
+    group_id: str,
     n_state: int,
     alpha: float,
     n_iter: int = 50,
 ) -> npt.NDArray[np.float64]:
-    network = Network(node_id=idx, neighbors=neighbors, namespace=namespace)
+    network = Network(node_id=idx, neighbors=neighbors, group_id=group_id)
 
-    states = np.zeros((n_iter, n_state))
-    npr.seed(int(idx))  # Ensure reproducibility for each node
-    states[0] = npr.uniform(-100.0, 100.0, n_state)
-
-    network.start()
+    x = np.zeros((n_iter, n_state))
+    npr.seed(int(idx))
+    x[0] = npr.uniform(-100.0, 100.0, n_state)
 
     try:
-        k = network.round_id
+        network.start()
+        network.wait_connected(timeout=30)
 
-        while k < n_iter - 1:
-            states[k + 1] = states[k] - network.laplacian(states[k]) * alpha
-
-            k = network.next_round()
+        for k in range(n_iter - 1):
+            x[k + 1] = x[k] - alpha * network.laplacian(exchange_id=k, state=x[k])
 
     finally:
-        network.stop()
+        network.close()
 
-    return states
+    return x
 
 
 def main() -> None:
-    ray.init()
-
-    try:
+    with ProcessPoolExecutor(max_workers=N_NODES) as executor:
         ring_tasks = [
-            consensus.remote(str(i + 1), ring[str(i + 1)], "ring", N_STATE, 0.35)
-            for i in range(N_NODES)
+            executor.submit(consensus, idx, ring[idx], "ring", N_STATE, 0.35)
+            for idx in NODES
         ]
-        star_tasks = [
-            consensus.remote(str(i + 1), star[str(i + 1)], "star", N_STATE, 0.35)
-            for i in range(N_NODES)
-        ]
+        ring_states = [task.result() for task in ring_tasks]
 
-        ring_states = [ray.get(task) for task in ring_tasks]
-        star_states = [ray.get(task) for task in star_tasks]
-    finally:
-        ray.shutdown()
+        star_tasks = [
+            executor.submit(consensus, idx, star[idx], "star", N_STATE, 0.35)
+            for idx in NODES
+        ]
+        star_states = [task.result() for task in star_tasks]
 
     colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple"]
 
@@ -80,7 +68,8 @@ def main() -> None:
         states = ring_states[i]
         for j in range(N_STATE):
             (line,) = ax1.plot(states[:, j], color=colors[i])
-            line.set_label(f"Node {i + 1}") if j == 0 else None
+            if j == 0:
+                line.set_label(f"Node {i + 1}")
 
     ax1.set_xlabel("Iteration")
     ax1.set_ylabel("State Value")
@@ -94,7 +83,8 @@ def main() -> None:
         states = star_states[i]
         for j in range(N_STATE):
             (line,) = ax2.plot(states[:, j], color=colors[i])
-            line.set_label(f"Node {i + 1}") if j == 0 else None
+            if j == 0:
+                line.set_label(f"Node {i + 1}")
 
     ax2.set_title(f"Star Graph Consensus (Nodes={N_NODES}, State Dim={N_STATE})")
     ax2.set_xlabel("Iteration")

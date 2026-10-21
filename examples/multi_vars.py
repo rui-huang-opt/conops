@@ -1,15 +1,11 @@
-import logging
+from concurrent.futures import ProcessPoolExecutor
 
-import ray
-
+import matplotlib.pyplot as plt
 import numpy as np
 import numpy.random as npr
 import numpy.typing as npt
-import matplotlib.pyplot as plt
 
 from conops import Graph, Network
-
-logging.basicConfig(level=logging.INFO)
 
 N_STATE = 3
 
@@ -23,7 +19,6 @@ ring = Graph(NODES, RING_EDGES)
 star = Graph(NODES, STAR_EDGES)
 
 
-@ray.remote
 def consensus(
     idx: str,
     neighbors: dict[str, float],
@@ -36,39 +31,45 @@ def consensus(
 
     x = np.zeros((n_iter, n_state))
     y = np.zeros((n_iter, n_state))
-    npr.seed(int(idx))  # Ensure reproducibility for each node
+
+    npr.seed(int(idx))
     x[0] = npr.uniform(-100.0, 100.0, n_state)
     y[0] = npr.uniform(-100.0, 100.0, n_state)
 
-    network.start()
-
     try:
-        k = network.round_id
+        network.start()
+        network.wait_connected(timeout=30)
 
-        while k < n_iter - 1:
-            x[k + 1] = x[k] - network.laplacian(x[k]) * alpha1
-            y[k + 1] = y[k] - network.laplacian(y[k]) * alpha2
+        for k in range(n_iter - 1):
+            x[k + 1] = x[k] - alpha1 * network.laplacian(
+                exchange_id=2 * k,
+                state=x[k],
+            )
 
-            k = network.next_round()
-
+            y[k + 1] = y[k] - alpha2 * network.laplacian(
+                exchange_id=2 * k + 1,
+                state=y[k],
+            )
     finally:
-        network.stop()
+        network.close()
 
     return x, y
 
 
 def main() -> None:
-    ray.init()
-
-    try:
+    with ProcessPoolExecutor(max_workers=N_NODES) as executor:
         tasks = [
-            consensus.remote(str(i + 1), ring[str(i + 1)], N_STATE, 0.35, 0.1)
+            executor.submit(
+                consensus,
+                str(i + 1),
+                ring[str(i + 1)],
+                N_STATE,
+                0.35,
+                0.1,
+            )
             for i in range(N_NODES)
         ]
-
-        results = [ray.get(task) for task in tasks]
-    finally:
-        ray.shutdown()
+        results = [task.result() for task in tasks]
 
     colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple"]
 
@@ -78,7 +79,8 @@ def main() -> None:
         x = results[i][0]
         for j in range(N_STATE):
             (line,) = ax1.plot(x[:, j], color=colors[i])
-            line.set_label(f"Node {i + 1}") if j == 0 else None
+            if j == 0:
+                line.set_label(f"Node {i + 1}")
 
     ax1.set_xlabel("Iteration")
     ax1.set_ylabel("x Value")
@@ -91,7 +93,8 @@ def main() -> None:
         y = results[i][1]
         for j in range(N_STATE):
             (line,) = ax2.plot(y[:, j], color=colors[i])
-            line.set_label(f"Node {i + 1}") if j == 0 else None
+            if j == 0:
+                line.set_label(f"Node {i + 1}")
 
     ax2.set_xlabel("Iteration")
     ax2.set_ylabel("y Value")

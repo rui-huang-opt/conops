@@ -3,8 +3,6 @@ use std::io;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
-
 pub async fn send_message<W>(writer: &mut W, data: &[u8], max_size: usize) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -27,15 +25,26 @@ where
     R: AsyncRead + Unpin,
 {
     let len = reader.read_u32().await? as usize;
+
     if len > max_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Message too large",
         ));
     }
+
     let mut buffer = BytesMut::with_capacity(len);
-    buffer.resize(len, 0);
-    reader.read_exact(&mut buffer).await?;
+    let mut limited = reader.take(len as u64);
+
+    while buffer.len() < len {
+        if limited.read_buf(&mut buffer).await? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Incomplete message",
+            ));
+        }
+    }
+
     Ok(buffer.freeze())
 }
 

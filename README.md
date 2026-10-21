@@ -1,14 +1,21 @@
 # ConOps (Consensus Operations)
-This Python package **conops** provides graph abstractions and synchronous neighbor-to-neighbor communication primitives for distributed consensus and optimization algorithms.
+
+**ConOps** is a Python package providing graph abstractions and synchronous neighbor-to-neighbor communication primitives for distributed consensus and optimization algorithms.
+
+It offers two communication backends:
+
+- **`Network`** — a Rust-backed TCP implementation with neighbor discovery, exchange matching, and basic connection recovery.
+- **`LiteNetwork`** — a lightweight ZeroMQ implementation for synchronous experiments that do not require application-level message recovery.
 
 ## Installation
-Install via pip:
+
+Install directly from GitHub:
 
 ```bash
 pip install git+https://github.com/rui-huang-opt/conops.git
 ```
 
-Or, for development:
+Or install in editable mode for development:
 
 ```bash
 git clone https://github.com/rui-huang-opt/conops.git
@@ -16,129 +23,160 @@ cd conops
 pip install -e .
 ```
 
+**Note:** These commands build the Rust extension from source, so a Rust toolchain is required. For an optimized local build during development, use `maturin develop --release` in an activated virtual environment.
+
 ## Undirected Graphs
-An **undirected graph** represents pairwise connections between objects without directional constraints. Formally defined as:
 
-$\mathcal{G} = (\mathcal{V}, \mathcal{E})$ where:  
-- $\mathcal{V}$: Set of vertices/nodes  
-- $\mathcal{E}$: Set of unordered edges $(u,v)$ (connections have no direction)
+An undirected graph is defined by
 
-### Key Properties
-1. **Symmetric Relationships**  
-   If $(u,v)$ exists, $(v,u)$ is the same edge
+$$
+\mathcal{G} = (\mathcal{V}, \mathcal{E}),
+$$
 
-2. **Neighbor Communication**  
-   For any edge $(u, v) \in \mathcal{E}$, nodes $u$ and $v$ can directly communicate with each other.
+where $\mathcal{V}$ is the set of nodes and $\mathcal{E}$ is the set of unordered edges. An edge $(u,v)$ represents a communication link between nodes $u$ and $v$.
 
-### Undirected Graph Example: Ring Topology
+### Ring topology
 
-#### Graph Definition
-- $\mathcal{V} = {1, 2, 3, 4, 5}$
-- $\mathcal{E} = {(1, 2), (2, 3), (3, 4), (4, 5), (5, 1)}$
+For a five-node ring,
 
-#### Define and Visualize the Graph
+$$
+\mathcal{V}=\{1,2,3,4,5\},\qquad
+\mathcal{E}=\{(1,2),(2,3),(3,4),(4,5),(5,1)\}.
+$$
+
+Create the topology using `Graph`:
 
 ```python
+from conops import Graph
+
 nodes = ["1", "2", "3", "4", "5"]
 edges = [("1", "2"), ("2", "3"), ("3", "4"), ("4", "5"), ("5", "1")]
 
-# Create the graph object
+graph = Graph(nodes, edges)
+
+# Each node only needs its own neighbors and edge weights.
+print(graph["1"])
+```
+
+You can visualize the topology with NetworkX and Matplotlib:
+
+```python
+import matplotlib.pyplot as plt
 import networkx as nx
 
 ring = nx.Graph()
 ring.add_nodes_from(nodes)
 ring.add_edges_from(edges)
 
-# Visualize the topology
-import matplotlib.pyplot as plt
-
-fig, ax = plt.subplots()
-nx.draw(ring, ax=ax, with_labels=True)
+nx.draw(ring, with_labels=True)
 plt.show()
 ```
 
-#### Visualization
+![Ring topology](docs/images/ring_topology.png)
 
-![Ring Topology Example](docs/images/ring_topology.png)
+## Deploying a Network
 
-## Deploying an Undirected Graph Network
+Each node needs only its own `node_id` and a dictionary mapping neighbor IDs to edge weights. Nodes run independently, without a central communication server.
 
-To deploy an undirected graph network using `conops`, follow these steps:
+The Rust-backed `Network` supports two connection modes:
 
-1. **Prepare local topology information**  
-   Each node should know:
-   - its own identifier `node_id`
-   - its neighbors as a dictionary `{neighbor_id: weight}`
+- **Automatic discovery (default):** mDNS discovers configured neighbors on a local network.
+- **Manual configuration:** `peer_endpoints` supplies TCP addresses directly, which is useful on servers and in Kubernetes environments where multicast discovery may not be available.
 
-2. **Initialize the node locally**  
-   On each machine or process, create a `Network` with the node's local graph information.
-
-3. **Start distributed communication**  
-   Each node communicates directly with its neighbors.
-
-> **Note:**  
-> `conops` is fully distributed and does not use a central server.  
-> Each node is initialized independently using its own `node_id` and neighbor dictionary.
-
-The `Network` class provides an interface for neighbor communication and common graph operators, such as the Laplacian operator, for distributed computation over the network topology.
-
-### Network Example: Laplacian Consensus
-
-The **consensus algorithm** is widely used in distributed systems to ensure that all nodes gradually reach agreement on their states through local communication. For an undirected graph, the state update of each node can be represented using the Laplacian matrix $L$:
-
-Let $x_i(k)$ denote the state of node $i$ at iteration $k$, and $x(k) = [x_1(k), x_2(k), \dots, x_n(k)]^\top$ be the vector of all node states. The Laplacian matrix $L$ is defined as:
-
-$$
-L_{ij} = 
-\begin{cases}
-\text{deg}(i), & i = j \\
--1, & (i, j) \in E \\
-0, & \text{otherwise}
-\end{cases}
-$$
-
-The consensus iteration formula is:
-
-$$
-x(k+1) = x(k) - \alpha L x(k)
-$$
-
-In each iteration, nodes only exchange information with their neighbors.
-With a suitable step size $\alpha > 0$, all node states converge to a common value. For a connected undirected graph with standard Laplacian consensus, this common value is the average of the initial states.
+For example, a node may be initialized as follows:
 
 ```python
-# On each node machine/process
 from conops import Network
 
-node_id = "1"  # Change this for each node (e.g., "2", "3", ...)
-neighbors = {"2": 0.45, "5": 0.45} # Change this for each node
+network = Network(
+    node_id="1",
+    neighbors={"2": 0.45, "5": 0.45},
+    group_id="consensus-demo",
+)
 
-# Create the node handle
-network = Network(node_id, neighbors)
+network.start()
+network.wait_connected(timeout=30)
+```
 
-# Achieve state convergence across all nodes through neighbor communication
+Once connected, the node can exchange NumPy arrays and apply operators such as `laplacian()` and `weighted_mix()`. **Each exchange needs an explicitly specified, monotonically increasing `exchange_id`**, and neighboring nodes must use the same ID for the same logical exchange.
+
+When configured manually, `peer_endpoints` maps the local node and its neighbors to endpoints, for example:
+
+```python
+peer_endpoints = {
+    "1": "tcp://node-1:5001",
+    "2": "tcp://node-2:5002",
+    "5": "tcp://node-5:5005",
+}
+
+network = Network(
+    node_id="1",
+    neighbors={"2": 0.45, "5": 0.45},
+    peer_endpoints=peer_endpoints,
+)
+```
+
+Here, `node-1`, `node-2`, and `node-5` are example hostnames; they must resolve to reachable machines or containers.
+
+## Laplacian Consensus Example
+
+For a connected undirected graph, a standard Laplacian consensus iteration is
+
+$$
+x(k+1) = x(k) - \alpha Lx(k),
+$$
+
+where $L$ is the graph Laplacian and $\alpha>0$ is a suitable step size. Each node only communicates with its neighbors. Under the usual step-size conditions, the node states converge to the average of their initial values.
+
+Run the following code in a separate process or machine for **each** node, changing `node_id` and its corresponding `neighbors` dictionary:
+
+```python
 import numpy as np
-import numpy.random as npr
 
-npr.seed(int(node_id))
-x = npr.uniform(-100.0, 100.0, 3)
+from conops import Network
 
+node_id = "1"
+neighbors = {"2": 0.45, "5": 0.45}
+
+network = Network(node_id=node_id, neighbors=neighbors)
+
+rng = np.random.default_rng(int(node_id))
+x = rng.uniform(-100.0, 100.0, 3)
 alpha = 0.45
 
 print(f"Node {node_id} initial state: {x}")
 
-network.start()
-
 try:
-   while network.round_id < 50: 
-      x = x - alpha * network.laplacian(x)
-      network.next_round()
+    network.start()
+    network.wait_connected(timeout=30)
 
+    for k in range(50):
+        x = x - alpha * network.laplacian(
+            exchange_id=k,
+            state=x,
+        )
 finally:
-   network.stop()
+    network.close()
 
 print(f"Node {node_id} final state: {x}")
 ```
 
-#### Results Plot
-![Consensus](docs/images/consensus.png)
+For a complete single-machine example that launches all nodes as separate processes, see the `examples` directory.
+
+![Laplacian consensus](docs/images/consensus.png)
+
+## Lightweight Communication
+
+`LiteNetwork` offers the same basic numerical operators through a simpler ZeroMQ communication path, without Rust `Network`'s exchange-ID matching and replay features. Its communication calls do not require an `exchange_id`:
+
+```python
+from conops import LiteNetwork
+
+network = LiteNetwork(node_id=node_id, neighbors=neighbors)
+try:
+    x = x - alpha * network.laplacian(x)
+finally:
+    network.close()
+```
+
+Choose `Network` for explicit exchange matching and basic recovery, or `LiteNetwork` for simple, tightly synchronized experiments.

@@ -1,9 +1,3 @@
-"""NumPy-facing ConOps network, backed by the Rust CoreNetwork.
-
-The Python layer owns serialization and numerical operations; Rust owns
-transport, neighbor discovery, exchange matching and connection recovery.
-"""
-
 import struct
 from collections.abc import KeysView, Mapping
 from typing import cast
@@ -46,7 +40,8 @@ def _parse_tcp_endpoint(endpoint: str) -> tuple[str, int]:
 
 
 class Network:
-    """Synchronous neighbor exchanges of NumPy arrays over the Rust backend.
+    """
+    Synchronous neighbor exchanges of NumPy arrays over the Rust backend.
 
     Parameters
     ----------
