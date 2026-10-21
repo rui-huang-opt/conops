@@ -9,9 +9,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bytes = "1.12.1"
-pyo3 = { version = "0.29", features = ["extension-module"] }
+pyo3 = "0.29"
 tokio = { version = "1.53.3", features = ["full"] }
-tokio-util = { version = "0.7.20", features = ["codec"] }
 mdns-sd = "0.21"
 numpy = "0.29"
 log = "0.4"

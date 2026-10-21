@@ -14,18 +14,8 @@ pub enum Message {
     Ack { exchange_id: u64 },
 }
 
-/// Encode a DATA frame. The returned Bytes can be cheaply cloned for peers.
-pub fn encode(exchange_id: u64, payload: &[u8]) -> Bytes {
-    let mut buffer = BytesMut::with_capacity(HEADER_SIZE + payload.len());
-    buffer.put_u8(TYPE_DATA);
-    buffer.put_u64(exchange_id);
-    buffer.extend_from_slice(payload);
-    buffer.freeze()
-}
-
 /// Encode the NumPy adapter's state directly into a single DATA allocation.
 /// DATA payload: 4-byte metadata length | metadata | contiguous array bytes.
-/// The wire format is identical to encode(id, prepacked_state_bytes).
 pub fn encode_state(exchange_id: u64, meta: &[u8], payload: &[u8]) -> io::Result<Bytes> {
     let meta_len = u32::try_from(meta.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Metadata exceeds u32"))?;
@@ -86,12 +76,26 @@ mod tests {
 
     #[test]
     fn test_data_roundtrip() {
+        let meta = b"meta";
+        let payload = b"\x00\x01\xff";
+
+        let encoded = encode_state(42, meta, payload).unwrap();
+
+        let mut expected = Vec::new();
+        expected.push(TYPE_DATA);
+        expected.extend_from_slice(&42u64.to_be_bytes());
+        expected.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+        expected.extend_from_slice(meta);
+        expected.extend_from_slice(payload);
+
+        assert_eq!(encoded.as_ref(), expected.as_slice());
+
         assert_eq!(
-            decode(encode(42, b"Hello ConOps")).unwrap(),
+            decode(encoded).unwrap(),
             Message::Data {
                 exchange_id: 42,
-                payload: Bytes::from_static(b"Hello ConOps")
-            },
+                payload: Bytes::from(expected[HEADER_SIZE..].to_vec()),
+            }
         );
     }
 
@@ -105,57 +109,29 @@ mod tests {
 
     #[test]
     fn test_empty_payload() {
+        let encoded = encode_state(0, b"", b"").unwrap();
+
+        assert_eq!(encoded.len(), HEADER_SIZE + 4);
+
         assert_eq!(
-            decode(encode(0, b"")).unwrap(),
+            decode(encoded).unwrap(),
             Message::Data {
                 exchange_id: 0,
-                payload: Bytes::new()
-            },
+                payload: Bytes::from_static(&[0, 0, 0, 0]),
+            }
         );
     }
 
     #[test]
     fn test_invalid_frames() {
         assert!(decode(Bytes::from_static(b"short")).is_err());
+
         let mut extra = encode_ack(10).to_vec();
         extra.push(0);
         assert!(decode(Bytes::from(extra)).is_err());
+
         let mut unknown = encode_ack(10).to_vec();
         unknown[0] = 255;
         assert!(decode(Bytes::from(unknown)).is_err());
-    }
-
-    #[test]
-    fn test_encode_state_compatible_with_existing_wire_format() {
-        let meta = b"meta";
-        let payload = b"\x00\x01\xff";
-        let encoded = encode_state(42, meta, payload).unwrap();
-
-        let mut old_payload = Vec::new();
-        old_payload.extend_from_slice(&(meta.len() as u32).to_be_bytes());
-        old_payload.extend_from_slice(meta);
-        old_payload.extend_from_slice(payload);
-
-        assert_eq!(encoded, encode(42, &old_payload));
-        match decode(encoded).unwrap() {
-            Message::Data {
-                exchange_id,
-                payload,
-            } => {
-                assert_eq!(exchange_id, 42);
-                assert_eq!(payload.as_ref(), old_payload.as_slice());
-            }
-            _ => panic!("expected DATA"),
-        }
-    }
-
-    #[test]
-    fn test_encode_state_empty_meta_and_array() {
-        let encoded = encode_state(0, b"", b"").unwrap();
-        assert_eq!(encoded.len(), HEADER_SIZE + 4);
-        match decode(encoded).unwrap() {
-            Message::Data { payload, .. } => assert_eq!(payload.as_ref(), &[0, 0, 0, 0]),
-            _ => panic!("expected DATA"),
-        }
     }
 }

@@ -29,18 +29,51 @@ use crate::message;
 use crate::tcp::{recv_message, send_message};
 
 const HELLO_MAX_SIZE: usize = 1024;
-const DATA_MAX_SIZE: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 const SEND_QUEUE_SIZE: usize = 32;
 const EVENT_QUEUE_SIZE: usize = 64;
 const EARLY_MAX_MESSAGES: usize = 128;
-const EARLY_MAX_BYTES: usize = 128 * 1024 * 1024;
+const DEFAULT_MAX_EARLY_BYTES: usize = 128 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 // Per-neighbor unacknowledged DATA is bounded (shared Bytes, no payload copy).
 const MAX_UNACKED_MESSAGES: usize = 4;
-const MAX_UNACKED_BYTES: usize = 128 * 1024 * 1024;
+const DEFAULT_MAX_UNACKED_BYTES: usize = 128 * 1024 * 1024;
+
+/// Limits are per Network instance, not global process settings.
+#[derive(Clone, Copy)]
+struct NetworkConfig {
+    max_message_size: usize,
+    max_unacked_bytes: usize,
+    max_early_bytes: usize,
+}
+
+impl NetworkConfig {
+    fn validate(&self) -> PyResult<()> {
+        // DATA frames have a 9-byte header and array frames another 4-byte
+        // metadata length. TCP framing uses a 32-bit length prefix.
+        if self.max_message_size < message::HEADER_SIZE + 4
+            || self.max_message_size > u32::MAX as usize
+        {
+            return Err(PyValueError::new_err(
+                "max_message_size must be between 13 and 4294967295 bytes",
+            ));
+        }
+        if self.max_unacked_bytes < self.max_message_size {
+            return Err(PyValueError::new_err(
+                "max_unacked_bytes must be >= max_message_size",
+            ));
+        }
+        if self.max_early_bytes < self.max_message_size {
+            return Err(PyValueError::new_err(
+                "max_early_bytes must be >= max_message_size",
+            ));
+        }
+        Ok(())
+    }
+}
 
 type Reply = mpsc::Sender<Result<(), String>>;
 type ExchangeResult = Result<HashMap<String, Bytes>, String>;
@@ -249,12 +282,17 @@ struct UnackedMessages {
 }
 
 impl UnackedMessages {
-    fn check_capacity(&self, exchange_id: u64, frame_size: usize) -> Result<(), String> {
+    fn check_capacity(
+        &self,
+        exchange_id: u64,
+        frame_size: usize,
+        max_unacked_bytes: usize,
+    ) -> Result<(), String> {
         if self.frames.contains_key(&exchange_id) {
             return Err(format!("Exchange {exchange_id} is already awaiting ACK"));
         }
         if self.frames.len() >= MAX_UNACKED_MESSAGES
-            || frame_size > MAX_UNACKED_BYTES.saturating_sub(self.bytes)
+            || frame_size > max_unacked_bytes.saturating_sub(self.bytes)
         {
             return Err("Unacknowledged message cache full".into());
         }
@@ -301,11 +339,12 @@ async fn read_peer(
     mut reader: OwnedReadHalf,
     peer_id: String,
     session: u64,
+    max_message_size: usize,
     events: async_mpsc::Sender<PeerEvent>,
 ) {
     loop {
         let received = async {
-            let frame = recv_message(&mut reader, DATA_MAX_SIZE).await?;
+            let frame = recv_message(&mut reader, max_message_size).await?;
             message::decode(frame)
         }
         .await;
@@ -360,10 +399,11 @@ async fn write_peer(
     mut outbound: async_mpsc::Receiver<Bytes>,
     peer_id: String,
     session: u64,
+    max_message_size: usize,
     events: async_mpsc::Sender<PeerEvent>,
 ) {
     while let Some(data) = outbound.recv().await {
-        if let Err(err) = send_message(&mut writer, &data, DATA_MAX_SIZE).await {
+        if let Err(err) = send_message(&mut writer, &data, max_message_size).await {
             let _ = events
                 .send(PeerEvent::Closed {
                     peer_id,
@@ -381,6 +421,7 @@ fn register_peer(
     expected: Option<&HashSet<String>>,
     peers: &mut HashMap<String, PeerConnection>,
     next_session: &mut u64,
+    max_message_size: usize,
     events: &async_mpsc::Sender<PeerEvent>,
     established: Established,
 ) {
@@ -403,12 +444,19 @@ fn register_peer(
         let (reader, writer) = stream.into_split();
         let (sender, outbound) = async_mpsc::channel(SEND_QUEUE_SIZE);
 
-        let reader_task = tokio::spawn(read_peer(reader, peer_id.clone(), session, events.clone()));
+        let reader_task = tokio::spawn(read_peer(
+            reader,
+            peer_id.clone(),
+            session,
+            max_message_size,
+            events.clone(),
+        ));
         let writer_task = tokio::spawn(write_peer(
             writer,
             outbound,
             peer_id.clone(),
             session,
+            max_message_size,
             events.clone(),
         ));
 
@@ -467,6 +515,7 @@ async fn run_network(
     neighbors: Option<HashSet<String>>,
     group_id: String,
     peer_endpoints: Option<HashMap<String, String>>,
+    config: NetworkConfig,
     mut stop_rx: oneshot::Receiver<()>,
     mut command_rx: async_mpsc::UnboundedReceiver<Command>,
     ready_tx: mpsc::SyncSender<Result<(), String>>,
@@ -525,7 +574,7 @@ async fn run_network(
     retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut pending: Option<PendingExchange> = None;
-    let mut early = EarlyMessages::new(EARLY_MAX_MESSAGES, EARLY_MAX_BYTES);
+    let mut early = EarlyMessages::new(EARLY_MAX_MESSAGES, config.max_early_bytes);
     let mut last_started: Option<u64> = None;
     // Retain unacknowledged DATA separately for each peer, even while disconnected.
     let mut unacked = HashMap::<String, UnackedMessages>::new();
@@ -619,7 +668,9 @@ async fn run_network(
                         if error.is_none() {
                             for (peer_id, peer) in &peers {
                                 if let Err(err) = unacked.entry(peer_id.clone())
-                                    .or_default().check_capacity(exchange_id, data.len())
+                                    .or_default().check_capacity(
+                                        exchange_id, data.len(), config.max_unacked_bytes,
+                                    )
                                 {
                                     error = Some(format!("Cannot retain message for {peer_id}: {err}"));
                                     break;
@@ -668,7 +719,7 @@ async fn run_network(
                         let old_count = peers.len();
                         register_peer(
                             &node_id, neighbors.as_ref(), &mut peers,
-                            &mut next_session, &event_tx, established,
+                            &mut next_session, config.max_message_size, &event_tx, established,
                         );
                         if peers.len() != old_count {
                             connected_before.insert(peer_id.clone());
@@ -842,6 +893,7 @@ pub struct CoreNetwork {
     neighbors: Option<HashSet<String>>,
     group_id: String,
     peer_endpoints: Option<HashMap<String, String>>,
+    config: NetworkConfig,
     commands: Option<async_mpsc::UnboundedSender<Command>>,
     stop_tx: Option<oneshot::Sender<()>>,
     worker: Option<thread::JoinHandle<()>>,
@@ -942,13 +994,25 @@ impl CoreNetwork {
 #[pymethods]
 impl CoreNetwork {
     #[new]
-    #[pyo3(signature = (node_id, port=0, neighbors=None, group_id="default", peer_endpoints=None))]
+    #[pyo3(signature = (
+        node_id,
+        port=0,
+        neighbors=None,
+        group_id="default",
+        peer_endpoints=None,
+        max_message_size=DEFAULT_MAX_MESSAGE_SIZE,
+        max_unacked_bytes=DEFAULT_MAX_UNACKED_BYTES,
+        max_early_bytes=DEFAULT_MAX_EARLY_BYTES,
+    ))]
     pub fn new(
         node_id: String,
         port: u16,
         neighbors: Option<Vec<String>>,
         group_id: &str,
         peer_endpoints: Option<HashMap<String, String>>,
+        max_message_size: usize,
+        max_unacked_bytes: usize,
+        max_early_bytes: usize,
     ) -> PyResult<Self> {
         if node_id.is_empty() || node_id.contains(char::is_whitespace) {
             return Err(PyValueError::new_err(
@@ -987,12 +1051,20 @@ impl CoreNetwork {
             }
         }
 
+        let config = NetworkConfig {
+            max_message_size,
+            max_unacked_bytes,
+            max_early_bytes,
+        };
+        config.validate()?;
+
         Ok(Self {
             node_id,
             port,
             neighbors,
             group_id: group_id.to_owned(),
             peer_endpoints,
+            config,
             commands: None,
             stop_tx: None,
             worker: None,
@@ -1012,6 +1084,7 @@ impl CoreNetwork {
         let neighbors = self.neighbors.clone();
         let group_id = self.group_id.clone();
         let peer_endpoints = self.peer_endpoints.clone();
+        let config = self.config;
         let worker = thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1023,6 +1096,7 @@ impl CoreNetwork {
                     neighbors,
                     group_id,
                     peer_endpoints,
+                    config,
                     stop_rx,
                     command_rx,
                     ready_tx,
@@ -1129,26 +1203,6 @@ impl CoreNetwork {
         }
     }
 
-    /// Existing raw-bytes interface, retained for direct CoreNetwork callers.
-    #[pyo3(signature = (exchange_id, data, timeout=None))]
-    pub fn exchange(
-        &self,
-        py: Python<'_>,
-        exchange_id: u64,
-        data: &Bound<'_, PyBytes>,
-        timeout: Option<f64>,
-    ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
-        if data.as_bytes().len() > DATA_MAX_SIZE - message::HEADER_SIZE {
-            return Err(PyValueError::new_err("Message too large"));
-        }
-        self.exchange_encoded(
-            py,
-            exchange_id,
-            message::encode(exchange_id, data.as_bytes()),
-            timeout,
-        )
-    }
-
     /// Encode metadata and a contiguous uint8 NumPy view in one Rust allocation.
     /// Python no longer constructs a large intermediate bytes object.
     #[pyo3(signature = (exchange_id, meta, payload, timeout=None))]
@@ -1169,7 +1223,7 @@ impl CoreNetwork {
             .and_then(|size| size.checked_add(meta.len()))
             .and_then(|size| size.checked_add(payload.len()))
             .ok_or_else(|| PyValueError::new_err("Message too large"))?;
-        if size > DATA_MAX_SIZE {
+        if size > self.config.max_message_size {
             return Err(PyValueError::new_err("Message too large"));
         }
         let encoded = message::encode_state(exchange_id, meta, payload)
@@ -1200,16 +1254,24 @@ mod ack_tests {
         let frame = Bytes::from_static(b"data");
 
         for exchange_id in 1..=MAX_UNACKED_MESSAGES as u64 {
-            cache.check_capacity(exchange_id, frame.len()).unwrap();
+            cache
+                .check_capacity(exchange_id, frame.len(), DEFAULT_MAX_UNACKED_BYTES)
+                .unwrap();
             cache.insert(exchange_id, frame.clone());
         }
-        assert!(cache.check_capacity(100, frame.len()).is_err());
+        assert!(
+            cache
+                .check_capacity(100, frame.len(), DEFAULT_MAX_UNACKED_BYTES)
+                .is_err()
+        );
         assert_eq!(cache.bytes, 4 * MAX_UNACKED_MESSAGES);
 
         cache.acknowledge(1);
         cache.acknowledge(1); // duplicate ACK is harmless
         assert_eq!(cache.bytes, 4 * (MAX_UNACKED_MESSAGES - 1));
-        cache.check_capacity(100, frame.len()).unwrap();
+        cache
+            .check_capacity(100, frame.len(), DEFAULT_MAX_UNACKED_BYTES)
+            .unwrap();
         cache.insert(100, frame);
     }
 
@@ -1217,8 +1279,65 @@ mod ack_tests {
     fn unacked_checks_total_bytes() {
         let mut cache = UnackedMessages::default();
         // Simulate a nearly-full cache without allocating a huge test buffer.
-        cache.bytes = MAX_UNACKED_BYTES - 1;
-        assert!(cache.check_capacity(11, 2).is_err());
-        cache.check_capacity(11, 1).unwrap();
+        cache.bytes = DEFAULT_MAX_UNACKED_BYTES - 1;
+        assert!(
+            cache
+                .check_capacity(11, 2, DEFAULT_MAX_UNACKED_BYTES)
+                .is_err()
+        );
+        cache
+            .check_capacity(11, 1, DEFAULT_MAX_UNACKED_BYTES)
+            .unwrap();
+    }
+
+    #[test]
+    fn unacked_uses_instance_budget() {
+        let mut cache = UnackedMessages::default();
+        cache.insert(1, Bytes::from_static(b"abcd"));
+        assert!(cache.check_capacity(2, 3, 6).is_err());
+        cache.check_capacity(2, 3, 7).unwrap();
+    }
+
+    #[test]
+    fn configurable_limits_are_validated() {
+        let good = NetworkConfig {
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_unacked_bytes: DEFAULT_MAX_UNACKED_BYTES,
+            max_early_bytes: DEFAULT_MAX_EARLY_BYTES,
+        };
+        assert!(good.validate().is_ok());
+        assert!(
+            NetworkConfig {
+                max_early_bytes: 1,
+                ..good
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            NetworkConfig {
+                max_unacked_bytes: 1,
+                ..good
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            NetworkConfig {
+                max_message_size: 12,
+                ..good
+            }
+            .validate()
+            .is_err()
+        );
+        #[cfg(target_pointer_width = "64")]
+        assert!(
+            NetworkConfig {
+                max_message_size: u32::MAX as usize + 1,
+                ..good
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

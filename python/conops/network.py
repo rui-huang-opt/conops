@@ -1,3 +1,9 @@
+"""NumPy-facing ConOps network, backed by the Rust CoreNetwork.
+
+The Python layer owns serialization and numerical operations; Rust owns
+transport, neighbor discovery, exchange matching and connection recovery.
+"""
+
 import struct
 from collections.abc import KeysView, Mapping
 from typing import cast
@@ -40,8 +46,7 @@ def _parse_tcp_endpoint(endpoint: str) -> tuple[str, int]:
 
 
 class Network:
-    """
-    Synchronous neighbor exchanges of NumPy arrays over the Rust backend.
+    """Synchronous neighbor exchanges of NumPy arrays over the Rust backend.
 
     Parameters
     ----------
@@ -68,8 +73,20 @@ class Network:
         addresses for initial connections and reconnection attempts.
         When ``None``, neighbors are discovered through mDNS.
 
+    max_message_size : int, optional
+        Maximum encoded DATA frame size in bytes. Defaults to 64 MiB.
+
+    max_unacked_bytes : int, optional
+        Maximum unacknowledged DATA retained per neighbor in bytes.
+        Defaults to 128 MiB.
+
+    max_early_bytes : int, optional
+        Maximum future-exchange DATA buffered in total in bytes.
+        Defaults to 128 MiB.
+
     Notes
     -----
+    The cache byte limits must each be at least ``max_message_size``.
     Exchange IDs must be strictly increasing on each node, and neighboring
     nodes must use the same ID for the same logical exchange.
     """
@@ -83,6 +100,9 @@ class Network:
         port: int = 0,
         transform: Transform | None = None,
         peer_endpoints: Mapping[str, str] | None = None,
+        max_message_size: int = 64 * 1024 * 1024,
+        max_unacked_bytes: int = 128 * 1024 * 1024,
+        max_early_bytes: int = 128 * 1024 * 1024,
     ) -> None:
         self._node_id = node_id
         self._neighbors = dict(neighbors)
@@ -98,6 +118,9 @@ class Network:
             neighbors=list(self._neighbors),
             group_id=group_id,
             peer_endpoints=peer_endpoints_,
+            max_message_size=max_message_size,
+            max_unacked_bytes=max_unacked_bytes,
+            max_early_bytes=max_early_bytes,
         )
 
     @property
