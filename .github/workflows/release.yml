@@ -4,7 +4,7 @@ name: Release Wheels
 on:
   push:
     tags:
-      - "v*"
+      - "[0-9]*"
 
 permissions:
   contents: read
