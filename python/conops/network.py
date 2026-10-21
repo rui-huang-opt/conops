@@ -224,9 +224,7 @@ class Network:
             raise ValueError("Invalid state frame: truncated metadata")
 
         meta = bytes(view[_META_LENGTH.size : offset])
-        # Existing transforms use np.frombuffer(), which accepts memoryview.
-        # The cast retains their old annotation without copying the payload.
-        payload = cast(bytes, view[offset:])
+        payload = view[offset:]
         return self._transform.decode(meta, payload)
 
     def exchange(

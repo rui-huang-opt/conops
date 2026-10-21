@@ -60,7 +60,7 @@ class Transform(Protocol):
         """
         ...
 
-    def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
+    def decode(self, meta_bytes: bytes, payload: bytes | memoryview) -> NDArray:
         """
         Decode the payload back into the original state using the meta data.
 
@@ -85,7 +85,7 @@ class Identity:
         meta_bytes = msgspec.msgpack.encode(meta)
         return meta_bytes, state
 
-    def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
+    def decode(self, meta_bytes: bytes, payload: bytes | memoryview) -> NDArray:
         meta = msgspec.msgpack.decode(meta_bytes, type=BasicMeta)
         dtype = np.dtype(meta.dtype)
         return np.frombuffer(payload, dtype=dtype).reshape(meta.shape)
@@ -159,7 +159,7 @@ class UniformQuantize:
 
         return meta_bytes, quantized_state
 
-    def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
+    def decode(self, meta_bytes: bytes, payload: bytes | memoryview) -> NDArray:
         meta = msgspec.msgpack.decode(meta_bytes, type=QuantizeMeta)
 
         dtype = np.dtype(meta.dtype)
@@ -264,7 +264,7 @@ class BlockUniformQuantize:
 
         return meta_bytes, quantized_state
 
-    def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
+    def decode(self, meta_bytes: bytes, payload: bytes | memoryview) -> NDArray:
         meta = msgspec.msgpack.decode(meta_bytes, type=BlockQuantizeMeta)
 
         dtype = np.dtype(meta.dtype)
@@ -356,7 +356,7 @@ class FixedUniformQuantize:
 
         return meta_bytes, quantized_state
 
-    def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
+    def decode(self, meta_bytes: bytes, payload: bytes | memoryview) -> NDArray:
         meta = msgspec.msgpack.decode(meta_bytes, type=FixedQuantizeMeta)
 
         dtype = np.dtype(meta.dtype)
@@ -423,7 +423,7 @@ class StochasticQuantize:
 
         return meta_bytes, quantized_state
 
-    def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
+    def decode(self, meta_bytes: bytes, payload: bytes | memoryview) -> NDArray:
         meta = msgspec.msgpack.decode(meta_bytes, type=QuantizeMeta)
 
         dtype = np.dtype(meta.dtype)
@@ -467,7 +467,7 @@ class SignQuantize:
 
         return meta_bytes, quantized_state
 
-    def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
+    def decode(self, meta_bytes: bytes, payload: bytes | memoryview) -> NDArray:
         meta = msgspec.msgpack.decode(meta_bytes, type=SignMeta)
 
         source_dtype = np.dtype(meta.source_dtype)
@@ -549,7 +549,7 @@ class DitheredQuantize:
 
         return meta_bytes, quantized_state
 
-    def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
+    def decode(self, meta_bytes: bytes, payload: bytes | memoryview) -> NDArray:
         meta = msgspec.msgpack.decode(meta_bytes, type=DitheredQuantizeMeta)
 
         dtype = np.dtype(meta.dtype)
@@ -597,7 +597,7 @@ class DPMechanism:
         meta_bytes = msgspec.msgpack.encode(meta)
         return meta_bytes, noisy_state
 
-    def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
+    def decode(self, meta_bytes: bytes, payload: bytes | memoryview) -> NDArray:
         meta = msgspec.msgpack.decode(meta_bytes, type=BasicMeta)
         dtype = np.dtype(meta.dtype)
         return np.frombuffer(payload, dtype=dtype).reshape(meta.shape)
@@ -631,7 +631,7 @@ class GaussianNoise:
         meta_bytes = msgspec.msgpack.encode(meta)
         return meta_bytes, noisy_state
 
-    def decode(self, meta_bytes: bytes, payload: bytes) -> NDArray:
+    def decode(self, meta_bytes: bytes, payload: bytes | memoryview) -> NDArray:
         meta = msgspec.msgpack.decode(meta_bytes, type=BasicMeta)
         dtype = np.dtype(meta.dtype)
         return np.frombuffer(payload, dtype=dtype).reshape(meta.shape)
