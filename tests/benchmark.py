@@ -35,19 +35,13 @@ def benchmark_rust(
         y = npr.uniform(-100.0, 100.0, n_state)
 
         for k in range(n_warmup):
-            network.exchange(exchange_id=k, state=x)
+            network.exchange(x, key=f"warmup-{k}")
 
         before = time.perf_counter()
 
         for k in range(n_iter - 1):
-            x = x - 0.45 * network.laplacian(
-                exchange_id=n_warmup + 2 * k,
-                state=x,
-            )
-            y = y - 0.2 * network.laplacian(
-                exchange_id=n_warmup + 2 * k + 1,
-                state=y,
-            )
+            x = x - 0.45 * network.laplacian(x, key=(k, "x"))
+            y = y - 0.2 * network.laplacian(y, key=(k, "y"))
 
         return time.perf_counter() - before
 

@@ -1,14 +1,9 @@
-"""NumPy-facing ConOps network, backed by the Rust CoreNetwork.
-
-The Python layer owns serialization and numerical operations; Rust owns
-transport, neighbor discovery, exchange matching and connection recovery.
-"""
-
 import struct
 from collections.abc import KeysView, Mapping
 from typing import cast
 from urllib.parse import urlsplit
 
+import msgspec
 import numpy as np
 from numpy.typing import NDArray
 
@@ -16,6 +11,25 @@ from ._core import CoreNetwork
 from .transform import Identity, Transform
 
 _META_LENGTH = struct.Struct("!I")
+
+ExchangeKey = int | str | tuple[int, str]
+
+
+def _encode_exchange_key(key: ExchangeKey) -> bytes:
+    """Encode a semantic key deterministically (never use Python hash())."""
+    if type(key) not in (int, str) and not (
+        type(key) is tuple
+        and len(key) == 2
+        and type(key[0]) is int
+        and type(key[1]) is str
+    ):
+        raise TypeError("key must be int, str, or tuple[int, str]")
+
+    encoded = msgspec.msgpack.encode(key)
+    if len(encoded) > 256:
+        raise ValueError("Encoded exchange key exceeds 256 bytes")
+
+    return encoded
 
 
 def _parse_tcp_endpoint(endpoint: str) -> tuple[str, int]:
@@ -87,8 +101,10 @@ class Network:
     Notes
     -----
     The cache byte limits must each be at least ``max_message_size``.
-    Exchange IDs must be strictly increasing on each node, and neighboring
-    nodes must use the same ID for the same logical exchange.
+    Every logical exchange needs a unique ``key``, used consistently by
+    neighboring nodes. Keys need not be ordered, but neighbors must execute
+    compatible sequences of exchanges. Key types: ``int``, ``str``, or
+    ``tuple[int, str]``. Encoded keys are limited to 256 bytes.
     """
 
     def __init__(
@@ -215,15 +231,16 @@ class Network:
 
     def exchange(
         self,
-        exchange_id: int,
         state: NDArray,
         *,
+        key: ExchangeKey,
         timeout: float | None = None,
     ) -> dict[str, NDArray]:
-        """Exchange ``state`` with all fixed neighbors at the given ID."""
+        """Exchange ``state`` with all fixed neighbors using a semantic key."""
+        encoded_key = _encode_exchange_key(key)
         meta, payload = self._prepare(state)
         incoming = self._core.exchange_array(
-            exchange_id,
+            encoded_key,
             meta,
             payload,
             timeout=timeout,
@@ -232,26 +249,26 @@ class Network:
 
     def exchange_as_array(
         self,
-        exchange_id: int,
         state: NDArray,
         *,
+        key: ExchangeKey,
         timeout: float | None = None,
     ) -> NDArray:
         """Return neighbors' states stacked in the order of ``neighbors``."""
-        received = self.exchange(exchange_id, state, timeout=timeout)
+        received = self.exchange(state, key=key, timeout=timeout)
         if not self._neighbors:
             return np.empty((0, *state.shape), dtype=state.dtype)
         return np.stack([received[peer_id] for peer_id in self._neighbors], axis=0)
 
     def laplacian(
         self,
-        exchange_id: int,
         state: NDArray,
         *,
+        key: ExchangeKey,
         timeout: float | None = None,
     ) -> NDArray:
         """Compute degree * state - sum(neighbor states)."""
-        received = self.exchange(exchange_id, state, timeout=timeout)
+        received = self.exchange(state, key=key, timeout=timeout)
         result = len(self._neighbors) * state
         for neighbor_state in received.values():
             result = result - neighbor_state
@@ -259,13 +276,13 @@ class Network:
 
     def weighted_mix(
         self,
-        exchange_id: int,
         state: NDArray,
         *,
+        key: ExchangeKey,
         timeout: float | None = None,
     ) -> NDArray:
         """Compute (1 - sum(weights)) * state + sum(weight * neighbor state)."""
-        received = self.exchange(exchange_id, state, timeout=timeout)
+        received = self.exchange(state, key=key, timeout=timeout)
         result = (1.0 - sum(self._neighbors.values())) * state
         for peer_id, neighbor_state in received.items():
             result = result + self._neighbors[peer_id] * neighbor_state

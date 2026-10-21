@@ -1,3 +1,7 @@
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
 from concurrent.futures import ProcessPoolExecutor
 
 import matplotlib.pyplot as plt
@@ -38,7 +42,7 @@ def consensus(
         network.wait_connected(timeout=30)
 
         for k in range(n_iter - 1):
-            x[k + 1] = x[k] - alpha * network.laplacian(exchange_id=k, state=x[k])
+            x[k + 1] = x[k] - alpha * network.laplacian(x[k], key=k)
 
     finally:
         network.close()

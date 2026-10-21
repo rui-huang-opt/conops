@@ -1,3 +1,7 @@
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
 from concurrent.futures import ProcessPoolExecutor
 
 import matplotlib.pyplot as plt
@@ -41,7 +45,7 @@ def consensus(
         network.wait_connected(timeout=30)
 
         for k in range(n_iter - 1):
-            x[k + 1] = network.weighted_mix(exchange_id=k, state=x[k])
+            x[k + 1] = network.weighted_mix(state=x[k], key=k)
     finally:
         network.close()
 

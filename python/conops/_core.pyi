@@ -19,7 +19,7 @@ class CoreNetwork:
     def wait_connected(self, timeout: float | None = None) -> None: ...
     def exchange_array(
         self,
-        exchange_id: int,
+        key: bytes,
         meta: bytes,
         payload: NDArray[np.uint8],
         timeout: float | None = None,

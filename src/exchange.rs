@@ -1,26 +1,26 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use bytes::Bytes;
 
 /// Collects exactly one message from each peer for an exchange.
 #[derive(Debug)]
 pub struct Batch {
-    exchange_id: u64,
+    key: Bytes,
     expected: HashSet<String>,
     received: HashMap<String, Bytes>,
 }
 
 impl Batch {
-    pub fn new(exchange_id: u64, peers: Vec<String>) -> Self {
+    pub fn new(key: Bytes, peers: Vec<String>) -> Self {
         Self {
-            exchange_id,
+            key,
             expected: peers.into_iter().collect(),
             received: HashMap::new(),
         }
     }
 
-    pub fn exchange_id(&self) -> u64 {
-        self.exchange_id
+    pub fn key(&self) -> &Bytes {
+        &self.key
     }
 
     pub fn insert(&mut self, peer: String, payload: Bytes) -> Result<bool, &'static str> {
@@ -47,11 +47,11 @@ impl Batch {
     }
 }
 
-/// Messages for exchange IDs that the local node has not started yet.
-/// Both message count and retained payload bytes are bounded.
+/// Messages for exchange keys not yet started locally.
+/// In sequential exchange programs a peer can be one exchange ahead.
 #[derive(Debug)]
 pub struct EarlyMessages {
-    messages: HashMap<u64, HashMap<String, Bytes>>,
+    messages: HashMap<Bytes, HashMap<String, Bytes>>,
     count: usize,
     bytes: usize,
     max_messages: usize,
@@ -71,16 +71,26 @@ impl EarlyMessages {
 
     pub fn insert(
         &mut self,
-        exchange_id: u64,
+        key: Bytes,
         peer: String,
         payload: Bytes,
     ) -> Result<bool, &'static str> {
         if self
             .messages
-            .get(&exchange_id)
+            .get(&key)
             .is_some_and(|messages| messages.contains_key(&peer))
         {
             return Ok(false);
+        }
+
+        // A single active Exchange per node means a correctly ordered peer
+        // should never have more than one *future* DATA outstanding here.
+        if self
+            .messages
+            .values()
+            .any(|messages| messages.contains_key(&peer))
+        {
+            return Err("Peer already has an early exchange message");
         }
 
         if self.count >= self.max_messages
@@ -91,40 +101,23 @@ impl EarlyMessages {
 
         self.count += 1;
         self.bytes += payload.len();
-        self.messages
-            .entry(exchange_id)
-            .or_default()
-            .insert(peer, payload);
+        self.messages.entry(key).or_default().insert(peer, payload);
         Ok(true)
     }
 
-    pub fn take(&mut self, exchange_id: u64) -> HashMap<String, Bytes> {
-        let messages = self.messages.remove(&exchange_id).unwrap_or_default();
+    pub fn take(&mut self, key: &Bytes) -> HashMap<String, Bytes> {
+        let messages = self.messages.remove(key).unwrap_or_default();
         self.count -= messages.len();
         self.bytes -= messages.values().map(Bytes::len).sum::<usize>();
         messages
     }
 
-    /// Drop all cached messages through `exchange_id` (inclusive).
-    pub fn discard_through(&mut self, exchange_id: u64) {
-        let expired: Vec<u64> = self
-            .messages
-            .keys()
-            .copied()
-            .filter(|id| *id <= exchange_id)
-            .collect();
-
-        for id in expired {
-            let _ = self.take(id);
-        }
-    }
-
-    /// Remove cached data from a disconnected peer (old sessions must not leak).
+    /// Remove cached data from a disconnected peer if explicitly requested.
     pub fn remove_peer(&mut self, peer_id: &str) {
-        let ids: Vec<u64> = self.messages.keys().copied().collect();
-        for id in ids {
+        let keys: Vec<Bytes> = self.messages.keys().cloned().collect();
+        for key in keys {
             let mut empty = false;
-            if let Some(messages) = self.messages.get_mut(&id) {
+            if let Some(messages) = self.messages.get_mut(&key) {
                 if let Some(data) = messages.remove(peer_id) {
                     self.count -= 1;
                     self.bytes -= data.len();
@@ -132,7 +125,41 @@ impl EarlyMessages {
                 empty = messages.is_empty();
             }
             if empty {
-                self.messages.remove(&id);
+                self.messages.remove(&key);
+            }
+        }
+    }
+}
+
+/// Bounded record of completed or cancelled keys; stores keys, not payloads.
+#[derive(Debug)]
+pub struct CompletedKeys {
+    keys: HashSet<Bytes>,
+    order: VecDeque<Bytes>,
+    capacity: usize,
+}
+
+impl CompletedKeys {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            keys: HashSet::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    pub fn contains(&self, key: &Bytes) -> bool {
+        self.keys.contains(key)
+    }
+
+    pub fn insert(&mut self, key: Bytes) {
+        if self.capacity == 0 || !self.keys.insert(key.clone()) {
+            return;
+        }
+        self.order.push_back(key);
+        if self.order.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.keys.remove(&oldest);
             }
         }
     }
@@ -142,44 +169,30 @@ impl EarlyMessages {
 mod tests {
     use super::*;
 
+    fn key(text: &'static [u8]) -> Bytes {
+        Bytes::from_static(text)
+    }
+
     #[test]
     fn test_batch() {
-        let mut batch = Batch::new(10, vec!["B".into(), "C".into()]);
-        assert_eq!(batch.exchange_id(), 10);
+        let mut batch = Batch::new(key(b"y"), vec!["B".into(), "C".into()]);
+        assert_eq!(batch.key(), &key(b"y"));
         assert!(!batch.is_complete());
-        assert_eq!(
-            batch.insert("B".into(), Bytes::from_static(&[1, 2, 3])),
-            Ok(true)
-        );
-        assert_eq!(
-            batch.insert("B".into(), Bytes::from_static(&[4, 5, 6])),
-            Ok(false)
-        );
-        assert!(!batch.is_complete());
-        assert_eq!(
-            batch.insert("C".into(), Bytes::from_static(&[7, 8, 9])),
-            Ok(true)
-        );
+        assert_eq!(batch.insert("B".into(), key(b"123")), Ok(true));
+        assert_eq!(batch.insert("B".into(), key(b"456")), Ok(false));
+        assert_eq!(batch.insert("C".into(), key(b"789")), Ok(true));
         assert!(batch.is_complete());
-        assert_eq!(batch.received["B"].as_ref(), &[1, 2, 3]);
-        assert!(
-            batch
-                .insert("D".into(), Bytes::from_static(b"bad"))
-                .is_err()
-        );
+        assert_eq!(batch.received["B"].as_ref(), b"123");
+        assert_eq!(batch.received["C"].as_ref(), b"789");
+        assert!(batch.insert("D".into(), key(b"bad")).is_err());
     }
 
     #[test]
     fn test_take() {
-        let mut batch = Batch::new(10, vec!["B".into(), "C".into()]);
-        batch
-            .insert("B".into(), Bytes::from_static(b"Hello B"))
-            .unwrap();
+        let mut batch = Batch::new(key(b"x"), vec!["B".into(), "C".into()]);
+        batch.insert("B".into(), key(b"Hello B")).unwrap();
         let mut batch = batch.take().unwrap_err();
-        assert!(!batch.is_complete());
-        batch
-            .insert("C".into(), Bytes::from_static(b"Hello C"))
-            .unwrap();
+        batch.insert("C".into(), key(b"Hello C")).unwrap();
         let received = batch.take().unwrap();
         assert_eq!(received["B"].as_ref(), b"Hello B");
         assert_eq!(received["C"].as_ref(), b"Hello C");
@@ -187,67 +200,54 @@ mod tests {
 
     #[test]
     fn test_empty_batch() {
-        let batch = Batch::new(0, vec![]);
+        let batch = Batch::new(key(b"x"), vec![]);
         assert!(batch.is_complete());
         assert!(batch.take().unwrap().is_empty());
     }
 
     #[test]
-    fn test_early_messages() {
+    fn test_early_messages_unordered_keys() {
         let mut early = EarlyMessages::new(10, 1024);
+        assert_eq!(early.insert(key(b"z"), "A".into(), key(b"A")), Ok(true));
+        assert_eq!(early.insert(key(b"a"), "B".into(), key(b"B")), Ok(true));
+        assert_eq!(early.insert(key(b"z"), "C".into(), key(b"C")), Ok(true));
         assert_eq!(
-            early.insert(10, "A".into(), Bytes::from_static(b"A10")),
-            Ok(true)
-        );
-        assert_eq!(
-            early.insert(11, "A".into(), Bytes::from_static(b"A11")),
-            Ok(true)
-        );
-        assert_eq!(
-            early.insert(10, "C".into(), Bytes::from_static(b"C10")),
-            Ok(true)
-        );
-        assert_eq!(
-            early.insert(10, "A".into(), Bytes::from_static(b"duplicate")),
+            early.insert(key(b"z"), "A".into(), key(b"duplicate")),
             Ok(false)
         );
-
-        let messages = early.take(10);
+        // One early DATA per peer: other future keys cannot accumulate.
+        assert!(early.insert(key(b"next"), "A".into(), key(b"bad")).is_err());
+        let messages = early.take(&key(b"z"));
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages["A"].as_ref(), b"A10");
-        assert_eq!(messages["C"].as_ref(), b"C10");
-        assert_eq!(early.take(11)["A"].as_ref(), b"A11");
-        assert!(early.take(11).is_empty());
+        assert_eq!(messages["A"].as_ref(), b"A");
+        assert_eq!(messages["C"].as_ref(), b"C");
+        assert_eq!(early.take(&key(b"a"))["B"].as_ref(), b"B");
     }
 
     #[test]
     fn test_early_limits_and_reclaim() {
         let mut early = EarlyMessages::new(2, 5);
-        assert_eq!(
-            early.insert(10, "A".into(), Bytes::from_static(b"123")),
-            Ok(true)
-        );
-        assert!(
-            early
-                .insert(10, "B".into(), Bytes::from_static(b"456"))
-                .is_err()
-        );
-        assert_eq!(
-            early.insert(11, "B".into(), Bytes::from_static(b"4")),
-            Ok(true)
-        );
-        assert!(early.insert(12, "C".into(), Bytes::new()).is_err());
-        early.discard_through(10);
-        assert_eq!(
-            early.insert(12, "C".into(), Bytes::from_static(b"5678")),
-            Ok(true)
-        );
+        assert_eq!(early.insert(key(b"z"), "A".into(), key(b"123")), Ok(true));
+        assert!(early.insert(key(b"z"), "B".into(), key(b"456")).is_err());
+        assert_eq!(early.insert(key(b"a"), "B".into(), key(b"4")), Ok(true));
+        assert!(early.insert(key(b"c"), "C".into(), Bytes::new()).is_err());
+        let _ = early.take(&key(b"z"));
+        assert_eq!(early.insert(key(b"c"), "C".into(), key(b"5678")), Ok(true));
         early.remove_peer("B");
-        assert!(early.take(11).is_empty());
-        assert_eq!(early.take(12)["C"].as_ref(), b"5678");
-        assert_eq!(
-            early.insert(13, "Z".into(), Bytes::from_static(b"12345")),
-            Ok(true)
-        );
+        assert!(early.take(&key(b"a")).is_empty());
+        assert_eq!(early.take(&key(b"c"))["C"].as_ref(), b"5678");
+    }
+
+    #[test]
+    fn test_completed_keys_are_bounded() {
+        let mut history = CompletedKeys::new(2);
+        history.insert(key(b"z"));
+        history.insert(key(b"a"));
+        history.insert(key(b"z")); // duplicate does not change eviction order
+        assert!(history.contains(&key(b"z")));
+        history.insert(key(b"q"));
+        assert!(!history.contains(&key(b"z")));
+        assert!(history.contains(&key(b"a")));
+        assert!(history.contains(&key(b"q")));
     }
 }

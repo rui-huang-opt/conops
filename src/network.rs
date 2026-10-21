@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::{c_int, c_void},
     future, io, ptr,
     sync::mpsc,
@@ -24,7 +24,7 @@ use tokio::{
 };
 
 use crate::discovery::{Discovery, DiscoveryEvent};
-use crate::exchange::{Batch, EarlyMessages};
+use crate::exchange::{Batch, CompletedKeys, EarlyMessages};
 use crate::message;
 use crate::tcp::{recv_message, send_message};
 
@@ -33,6 +33,7 @@ const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 const SEND_QUEUE_SIZE: usize = 32;
 const EVENT_QUEUE_SIZE: usize = 64;
 const EARLY_MAX_MESSAGES: usize = 128;
+const COMPLETED_MAX_KEYS: usize = 128;
 const DEFAULT_MAX_EARLY_BYTES: usize = 128 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,13 +53,13 @@ struct NetworkConfig {
 
 impl NetworkConfig {
     fn validate(&self) -> PyResult<()> {
-        // DATA frames have a 9-byte header and array frames another 4-byte
-        // metadata length. TCP framing uses a 32-bit length prefix.
-        if self.max_message_size < message::HEADER_SIZE + 4
+        // DATA frames have a 3-byte fixed header, at least one key byte,
+        // and a 4-byte metadata length. TCP framing uses a 32-bit length.
+        if self.max_message_size < message::HEADER_SIZE + 1 + 4
             || self.max_message_size > u32::MAX as usize
         {
             return Err(PyValueError::new_err(
-                "max_message_size must be between 13 and 4294967295 bytes",
+                "max_message_size must be between 8 and 4294967295 bytes",
             ));
         }
         if self.max_unacked_bytes < self.max_message_size {
@@ -88,9 +89,9 @@ struct ReceivedBuffer {
 
 #[pymethods]
 impl ReceivedBuffer {
-    // SAFETY: `data` is immutable and owned by this object. The exported
-    // Py_buffer holds a strong reference to `slf`, so `data` cannot be freed
-    // until the consumer releases its view. No reallocations are possible.
+    // SAFETY: `data` is immutable and owned by this object.
+    // The exported Py_buffer holds a strong reference to `slf`, so `data` cannot be freed until the consumer releases its view.
+    // No reallocations are possible.
     unsafe fn __getbuffer__(
         slf: Bound<'_, Self>,
         view: *mut ffi::Py_buffer,
@@ -148,12 +149,12 @@ enum Command {
         reply: mpsc::Sender<Vec<String>>,
     },
     Exchange {
-        exchange_id: u64,
-        data: Bytes, // already encoded as exchange_id + payload
+        key: Bytes,
+        data: Bytes, // already encoded with its key
         reply: ExchangeReply,
     },
     CancelExchange {
-        exchange_id: u64,
+        key: Bytes,
     },
 }
 
@@ -164,8 +165,8 @@ struct Established {
     reply: Option<Reply>,
 }
 
-// A connection attempt always reports completion, so 'connecting' gets cleared
-// even if TCP/HELLO fails. Incoming accepted connections have no attempt ID.
+// A connection attempt always reports completion, so 'connecting' gets cleared even if TCP/HELLO fails.
+// Incoming accepted connections have no attempt ID.
 enum ConnectEvent {
     Established(Established),
     Failed {
@@ -223,8 +224,7 @@ fn start_connect(
         };
 
         if let Err(err) = events.send(event) {
-            // Ensure a blocking Python connect() does not wait unnecessarily
-            // when the Tokio event loop has already shut down.
+            // Ensure a blocking Python connect() does not wait unnecessarily when the Tokio event loop has already shut down.
             match err.0 {
                 ConnectEvent::Established(e) => {
                     if let Some(reply) = e.reply {
@@ -246,12 +246,12 @@ enum PeerEvent {
     Ack {
         peer_id: String,
         session: u64,
-        exchange_id: u64,
+        key: Bytes,
     },
     Data {
         peer_id: String,
         session: u64,
-        exchange_id: u64,
+        key: Bytes,
         data: Bytes,
     },
     Closed {
@@ -273,23 +273,23 @@ struct PendingExchange {
     reply: ExchangeReply,
 }
 
-/// Messages that this neighbor has not acknowledged, retained across TCP sessions.
-/// All access happens on the network event loop, so no Mutex is needed.
+/// Messages not yet ACKed by this neighbor. Preserve the send order on replay.
+/// Only a few frames are retained; a VecDeque keeps this simpler than two maps.
 #[derive(Default)]
 struct UnackedMessages {
-    frames: BTreeMap<u64, Bytes>,
+    frames: VecDeque<(Bytes, Bytes)>,
     bytes: usize,
 }
 
 impl UnackedMessages {
     fn check_capacity(
         &self,
-        exchange_id: u64,
+        key: &Bytes,
         frame_size: usize,
         max_unacked_bytes: usize,
     ) -> Result<(), String> {
-        if self.frames.contains_key(&exchange_id) {
-            return Err(format!("Exchange {exchange_id} is already awaiting ACK"));
+        if self.frames.iter().any(|(stored, _)| stored == key) {
+            return Err("Exchange key is already awaiting ACK".into());
         }
         if self.frames.len() >= MAX_UNACKED_MESSAGES
             || frame_size > max_unacked_bytes.saturating_sub(self.bytes)
@@ -300,13 +300,14 @@ impl UnackedMessages {
     }
 
     // Caller must have passed check_capacity() on the same event-loop iteration.
-    fn insert(&mut self, exchange_id: u64, frame: Bytes) {
+    fn insert(&mut self, key: Bytes, frame: Bytes) {
         self.bytes += frame.len();
-        self.frames.insert(exchange_id, frame);
+        self.frames.push_back((key, frame));
     }
 
-    fn acknowledge(&mut self, exchange_id: u64) {
-        if let Some(frame) = self.frames.remove(&exchange_id) {
+    fn acknowledge(&mut self, key: &Bytes) {
+        if let Some(index) = self.frames.iter().position(|(stored, _)| stored == key) {
+            let (_, frame) = self.frames.remove(index).expect("checked index");
             self.bytes -= frame.len();
         }
     }
@@ -314,14 +315,15 @@ impl UnackedMessages {
 
 async fn handshake(mut stream: TcpStream, my_id: &str) -> io::Result<(String, TcpStream)> {
     stream.set_nodelay(true)?;
-    let hello = format!("HELLO {my_id}");
+    // The DATA/ACK frame layout changed: reject peers speaking the old protocol.
+    let hello = format!("HELLO2 {my_id}");
     send_message(&mut stream, hello.as_bytes(), HELLO_MAX_SIZE).await?;
 
     let buffer = recv_message(&mut stream, HELLO_MAX_SIZE).await?;
     let text = std::str::from_utf8(&buffer)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in HELLO"))?;
     let peer_id = text
-        .strip_prefix("HELLO ")
+        .strip_prefix("HELLO2 ")
         .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid HELLO"))?;
 
@@ -350,15 +352,12 @@ async fn read_peer(
         .await;
 
         match received {
-            Ok(message::Message::Data {
-                exchange_id,
-                payload,
-            }) => {
+            Ok(message::Message::Data { key, payload }) => {
                 if events
                     .send(PeerEvent::Data {
                         peer_id: peer_id.clone(),
                         session,
-                        exchange_id,
+                        key,
                         data: payload,
                     })
                     .await
@@ -367,12 +366,12 @@ async fn read_peer(
                     return;
                 }
             }
-            Ok(message::Message::Ack { exchange_id }) => {
+            Ok(message::Message::Ack { key }) => {
                 if events
                     .send(PeerEvent::Ack {
                         peer_id: peer_id.clone(),
                         session,
-                        exchange_id,
+                        key,
                     })
                     .await
                     .is_err()
@@ -477,18 +476,24 @@ fn register_peer(
     }
 }
 
-fn fail_exchange(pending: &mut Option<PendingExchange>, reason: String) {
+fn fail_exchange(
+    pending: &mut Option<PendingExchange>,
+    completed: &mut CompletedKeys,
+    reason: String,
+) {
     if let Some(active) = pending.take() {
+        completed.insert(active.batch.key().clone());
         let _ = active.reply.send(Err(reason));
     }
 }
 
-fn complete_exchange(pending: &mut Option<PendingExchange>) {
+fn complete_exchange(pending: &mut Option<PendingExchange>, completed: &mut CompletedKeys) {
     if pending
         .as_ref()
         .is_some_and(|active| active.batch.is_complete())
     {
         let active = pending.take().expect("checked pending exchange");
+        completed.insert(active.batch.key().clone());
         let results = active.batch.take().expect("checked complete batch");
         let _ = active.reply.send(Ok(results));
     }
@@ -563,8 +568,8 @@ async fn run_network(
     let mut next_session = 0u64;
     let mut connecting = HashSet::<String>::new();
     let mut connected_before = HashSet::<String>::new();
-    // Static endpoints are known from startup, so the existing retry and replay
-    // paths work without mDNS. Only the smaller node ID initiates connections.
+    // Static endpoints are known from startup, so the existing retry and replay paths work without mDNS.
+    // Only the smaller node ID initiates connections.
     let mut addresses: HashMap<String, Vec<String>> = peer_endpoints
         .unwrap_or_default()
         .into_iter()
@@ -575,7 +580,7 @@ async fn run_network(
 
     let mut pending: Option<PendingExchange> = None;
     let mut early = EarlyMessages::new(EARLY_MAX_MESSAGES, config.max_early_bytes);
-    let mut last_started: Option<u64> = None;
+    let mut completed = CompletedKeys::new(COMPLETED_MAX_KEYS);
     // Retain unacknowledged DATA separately for each peer, even while disconnected.
     let mut unacked = HashMap::<String, UnackedMessages>::new();
 
@@ -624,15 +629,13 @@ async fn run_network(
                         ids.sort();
                         let _ = reply.send(ids);
                     }
-                    Some(Command::Exchange { exchange_id, data, reply }) => {
+                    Some(Command::Exchange { key, data, reply }) => {
                         if pending.is_some() {
                             let _ = reply.send(Err("Another exchange is in progress".into()));
                             continue;
                         }
-                        if last_started.is_some_and(|last| exchange_id <= last) {
-                            let _ = reply.send(Err(format!(
-                                "Exchange ID {exchange_id} must be greater than the last started ID"
-                            )));
+                        if completed.contains(&key) {
+                            let _ = reply.send(Err("Exchange key has already been used".into()));
                             continue;
                         }
 
@@ -645,17 +648,11 @@ async fn run_network(
                             }
                         }
 
-                        // A local exchange snapshots exactly the currently connected neighbors.
-                        // IDs must increase, even if an exchange later fails or times out.
-                        last_started = Some(exchange_id);
-                        if exchange_id > 0 {
-                            early.discard_through(exchange_id - 1);
-                        }
-                        let mut batch = Batch::new(exchange_id, peers.keys().cloned().collect());
+                        let mut batch = Batch::new(key.clone(), peers.keys().cloned().collect());
 
                         // Reuse messages that arrived before this node entered the exchange.
                         let mut error = None;
-                        for (peer_id, payload) in early.take(exchange_id) {
+                        for (peer_id, payload) in early.take(&key) {
                             if let Err(err) = batch.insert(peer_id.clone(), payload) {
                                 error = Some(format!("Cannot use cached message from {peer_id}: {err}"));
                                 break;
@@ -669,7 +666,7 @@ async fn run_network(
                             for (peer_id, peer) in &peers {
                                 if let Err(err) = unacked.entry(peer_id.clone())
                                     .or_default().check_capacity(
-                                        exchange_id, data.len(), config.max_unacked_bytes,
+                                        &key, data.len(), config.max_unacked_bytes,
                                     )
                                 {
                                     error = Some(format!("Cannot retain message for {peer_id}: {err}"));
@@ -692,16 +689,17 @@ async fn run_network(
                             // Clone(Bytes) shares the allocation across all neighbors.
                             for (peer_id, permit) in permits {
                                 unacked.entry(peer_id).or_default()
-                                    .insert(exchange_id, data.clone());
+                                    .insert(key.clone(), data.clone());
                                 permit.send(data.clone());
                             }
                             pending = Some(PendingExchange { batch, reply });
-                            complete_exchange(&mut pending); // e.g. no neighbors / all early data
+                            complete_exchange(&mut pending, &mut completed);
                         }
                     }
-                    Some(Command::CancelExchange { exchange_id }) => {
-                        if pending.as_ref().is_some_and(|p| p.batch.exchange_id() == exchange_id) {
-                            fail_exchange(&mut pending, "Exchange cancelled after timeout".into());
+                    Some(Command::CancelExchange { key }) => {
+                        if pending.as_ref().is_some_and(|p| p.batch.key() == &key) {
+                            fail_exchange(&mut pending, &mut completed,
+                                "Exchange cancelled after timeout".into());
                         }
                     }
                     None => break,
@@ -725,10 +723,10 @@ async fn run_network(
                             connected_before.insert(peer_id.clone());
                             if is_reconnect {
                                 // Replay only DATA for which this particular peer's ACK
-                                // has not arrived. BTreeMap preserves Exchange ID order.
+                                // has not arrived. Replay follows the original send order.
                                 let sender = &peers.get(&peer_id).expect("new peer").sender;
                                 let result = unacked.get(&peer_id).map(|messages| {
-                                    messages.frames.values().try_for_each(|frame| {
+                                    messages.frames.iter().try_for_each(|(_, frame)| {
                                         sender.try_send(frame.clone()).map_err(|err| err.to_string())
                                     })
                                 });
@@ -738,7 +736,7 @@ async fn run_network(
                                 }
                             } else {
                                 // Only an entirely new neighbor changes the topology.
-                                fail_exchange(&mut pending, "Peer set changed during exchange".into());
+                                fail_exchange(&mut pending, &mut completed, "Peer set changed during exchange".into());
                             }
                         }
                     }
@@ -811,37 +809,36 @@ async fn run_network(
 
             event = event_rx.recv() => {
                 match event {
-                    Some(PeerEvent::Ack { peer_id, session, exchange_id }) => {
+                    Some(PeerEvent::Ack { peer_id, session, key }) => {
                         if peers.get(&peer_id).is_some_and(|p| p.session == session) {
                             if let Some(messages) = unacked.get_mut(&peer_id) {
-                                messages.acknowledge(exchange_id);
+                                messages.acknowledge(&key);
                             }
                         }
                     }
-                    Some(PeerEvent::Data { peer_id, session, exchange_id, data }) => {
+                    Some(PeerEvent::Data { peer_id, session, key, data }) => {
                         if !peers.get(&peer_id).is_some_and(|p| p.session == session) {
                             continue; // event from a previous TCP session
                         }
 
-                        let accepted = if pending.as_ref().is_some_and(|p| p.batch.exchange_id() == exchange_id) {
+                        let accepted = if pending.as_ref().is_some_and(|p| p.batch.key() == &key) {
                             match pending.as_mut().expect("checked pending")
                                 .batch.insert(peer_id.clone(), data)
                             {
                                 Ok(_) => true, // a duplicate is still acknowledged
                                 Err(err) => {
-                                    fail_exchange(&mut pending, format!(
+                                    fail_exchange(&mut pending, &mut completed, format!(
                                         "Invalid exchange message from {peer_id}: {err}"
                                     ));
                                     false
                                 }
                             }
-                        } else if last_started.is_some_and(|last| exchange_id <= last) {
-                            // Already finished / cancelled locally: terminally discard.
-                            // ACK so the peer can stop retrying an obsolete frame.
+                        } else if completed.contains(&key) {
+                            // Already completed / cancelled: discard and ACK the duplicate.
                             true
                         } else {
-                            // Future exchange: ACK only after bounded cache accepts it.
-                            match early.insert(exchange_id, peer_id.clone(), data) {
+                            // Not yet started locally: ACK only after bounded cache accepts it.
+                            match early.insert(key.clone(), peer_id.clone(), data) {
                                 Ok(_) => true,
                                 Err(err) => {
                                     disconnect_peer(&node_id, &mut peers, &peer_id, err);
@@ -851,15 +848,14 @@ async fn run_network(
                         };
 
                         if accepted {
-                            // The ACK is best-effort asynchronous: exchange() never waits for it.
-                            // On queue failure, reconnect/replay rather than claim delivery.
+                            // ACK is asynchronous: exchange() does not wait for it.
                             if let Some(peer) = peers.get(&peer_id) {
-                                if let Err(err) = peer.sender.try_send(message::encode_ack(exchange_id)) {
+                                if let Err(err) = peer.sender.try_send(message::encode_ack(&key)) {
                                     disconnect_peer(&node_id, &mut peers, &peer_id,
                                         &format!("Cannot queue ACK: {err}"));
                                 }
                             }
-                            complete_exchange(&mut pending);
+                            complete_exchange(&mut pending, &mut completed);
                         }
                     }
                     Some(PeerEvent::Closed { peer_id, session, reason }) => {
@@ -873,7 +869,7 @@ async fn run_network(
         }
     }
 
-    fail_exchange(&mut pending, "Network stopped".into());
+    fail_exchange(&mut pending, &mut completed, "Network stopped".into());
     for (_, peer) in peers.drain() {
         peer.reader.abort();
         peer.writer.abort();
@@ -904,7 +900,7 @@ impl CoreNetwork {
     fn exchange_encoded(
         &self,
         py: Python<'_>,
-        exchange_id: u64,
+        key: Bytes,
         encoded: Bytes,
         timeout: Option<f64>,
     ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
@@ -927,7 +923,7 @@ impl CoreNetwork {
         let (reply, mut result_rx) = mpsc::channel();
         commands
             .send(Command::Exchange {
-                exchange_id,
+                key: key.clone(),
                 data: encoded,
                 reply,
             })
@@ -956,7 +952,7 @@ impl CoreNetwork {
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // Process Ctrl+C and other Python signals.
                     if let Err(err) = py.check_signals() {
-                        let _ = commands.send(Command::CancelExchange { exchange_id });
+                        let _ = commands.send(Command::CancelExchange { key: key.clone() });
                         return Err(err);
                     }
 
@@ -979,10 +975,8 @@ impl CoreNetwork {
             Ok(Err(err)) => Err(PyRuntimeError::new_err(err)),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Cancel the pending local batch; late messages will be treated as obsolete.
-                let _ = commands.send(Command::CancelExchange { exchange_id });
-                Err(PyTimeoutError::new_err(format!(
-                    "Exchange {exchange_id} timed out"
-                )))
+                let _ = commands.send(Command::CancelExchange { key: key.clone() });
+                Err(PyTimeoutError::new_err("Exchange timed out"))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(PyRuntimeError::new_err(
                 "Network worker stopped during exchange",
@@ -1205,30 +1199,32 @@ impl CoreNetwork {
 
     /// Encode metadata and a contiguous uint8 NumPy view in one Rust allocation.
     /// Python no longer constructs a large intermediate bytes object.
-    #[pyo3(signature = (exchange_id, meta, payload, timeout=None))]
+    #[pyo3(signature = (key, meta, payload, timeout=None))]
     pub fn exchange_array(
         &self,
         py: Python<'_>,
-        exchange_id: u64,
+        key: &Bound<'_, PyBytes>,
         meta: &Bound<'_, PyBytes>,
         payload: PyReadonlyArray1<'_, u8>,
         timeout: Option<f64>,
     ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
+        let key = key.as_bytes();
         let meta = meta.as_bytes();
         let payload = payload.as_slice().map_err(|_| {
             PyValueError::new_err("payload must be a contiguous 1-D uint8 NumPy array")
         })?;
         let size = message::HEADER_SIZE
-            .checked_add(4)
+            .checked_add(key.len())
+            .and_then(|size| size.checked_add(4))
             .and_then(|size| size.checked_add(meta.len()))
             .and_then(|size| size.checked_add(payload.len()))
             .ok_or_else(|| PyValueError::new_err("Message too large"))?;
         if size > self.config.max_message_size {
             return Err(PyValueError::new_err("Message too large"));
         }
-        let encoded = message::encode_state(exchange_id, meta, payload)
+        let encoded = message::encode_state(key, meta, payload)
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        self.exchange_encoded(py, exchange_id, encoded, timeout)
+        self.exchange_encoded(py, Bytes::copy_from_slice(key), encoded, timeout)
     }
 
     pub fn close(&mut self, py: Python<'_>) -> PyResult<()> {
@@ -1254,25 +1250,43 @@ mod ack_tests {
         let frame = Bytes::from_static(b"data");
 
         for exchange_id in 1..=MAX_UNACKED_MESSAGES as u64 {
+            let key = Bytes::copy_from_slice(&exchange_id.to_be_bytes());
             cache
-                .check_capacity(exchange_id, frame.len(), DEFAULT_MAX_UNACKED_BYTES)
+                .check_capacity(&key, frame.len(), DEFAULT_MAX_UNACKED_BYTES)
                 .unwrap();
-            cache.insert(exchange_id, frame.clone());
+            cache.insert(key, frame.clone());
         }
         assert!(
             cache
-                .check_capacity(100, frame.len(), DEFAULT_MAX_UNACKED_BYTES)
+                .check_capacity(
+                    &Bytes::from_static(b"100"),
+                    frame.len(),
+                    DEFAULT_MAX_UNACKED_BYTES
+                )
                 .is_err()
         );
         assert_eq!(cache.bytes, 4 * MAX_UNACKED_MESSAGES);
 
-        cache.acknowledge(1);
-        cache.acknowledge(1); // duplicate ACK is harmless
+        cache.acknowledge(&Bytes::copy_from_slice(&1u64.to_be_bytes()));
+        cache.acknowledge(&Bytes::copy_from_slice(&1u64.to_be_bytes())); // duplicate ACK is harmless
         assert_eq!(cache.bytes, 4 * (MAX_UNACKED_MESSAGES - 1));
         cache
-            .check_capacity(100, frame.len(), DEFAULT_MAX_UNACKED_BYTES)
+            .check_capacity(
+                &Bytes::from_static(b"100"),
+                frame.len(),
+                DEFAULT_MAX_UNACKED_BYTES,
+            )
             .unwrap();
-        cache.insert(100, frame);
+        cache.insert(Bytes::from_static(b"100"), frame);
+    }
+
+    #[test]
+    fn unacked_replays_in_send_order() {
+        let mut cache = UnackedMessages::default();
+        cache.insert(Bytes::from_static(b"z"), Bytes::from_static(b"first"));
+        cache.insert(Bytes::from_static(b"a"), Bytes::from_static(b"second"));
+        assert_eq!(cache.frames[0].0.as_ref(), b"z");
+        assert_eq!(cache.frames[1].0.as_ref(), b"a");
     }
 
     #[test]
@@ -1282,20 +1296,26 @@ mod ack_tests {
         cache.bytes = DEFAULT_MAX_UNACKED_BYTES - 1;
         assert!(
             cache
-                .check_capacity(11, 2, DEFAULT_MAX_UNACKED_BYTES)
+                .check_capacity(&Bytes::from_static(b"11"), 2, DEFAULT_MAX_UNACKED_BYTES)
                 .is_err()
         );
         cache
-            .check_capacity(11, 1, DEFAULT_MAX_UNACKED_BYTES)
+            .check_capacity(&Bytes::from_static(b"11"), 1, DEFAULT_MAX_UNACKED_BYTES)
             .unwrap();
     }
 
     #[test]
     fn unacked_uses_instance_budget() {
         let mut cache = UnackedMessages::default();
-        cache.insert(1, Bytes::from_static(b"abcd"));
-        assert!(cache.check_capacity(2, 3, 6).is_err());
-        cache.check_capacity(2, 3, 7).unwrap();
+        cache.insert(Bytes::from_static(b"old"), Bytes::from_static(b"abcd"));
+        assert!(
+            cache
+                .check_capacity(&Bytes::from_static(b"new"), 3, 6)
+                .is_err()
+        );
+        cache
+            .check_capacity(&Bytes::from_static(b"new"), 3, 7)
+            .unwrap();
     }
 
     #[test]
@@ -1324,7 +1344,7 @@ mod ack_tests {
         );
         assert!(
             NetworkConfig {
-                max_message_size: 12,
+                max_message_size: 7,
                 ..good
             }
             .validate()

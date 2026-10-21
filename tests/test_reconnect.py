@@ -16,6 +16,7 @@ import struct
 import threading
 import time
 
+import msgspec
 import numpy as np
 
 from conops import Network
@@ -55,6 +56,7 @@ class FaultProxy:
     def __init__(self, target_port: int, cut_exchange: int):
         self.target_port = target_port
         self.cut_exchange = cut_exchange
+        self.cut_key = msgspec.msgpack.encode(cut_exchange)
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.listener.bind(("127.0.0.1", 0))
@@ -142,13 +144,17 @@ class FaultProxy:
                 size = struct.unpack("!I", prefix)[0]
                 frame = recv_exact(source, size)
 
-                # DATA frame = type: u8 (0), exchange_id: u64 (big endian), payload.
-                target_data = (
-                    not self._cut.is_set()
-                    and len(frame) >= 9
-                    and frame[0] == 0
-                    and struct.unpack_from("!Q", frame, 1)[0] == self.cut_exchange
-                )
+                # DATA frame: type (1 byte) | key length (2 bytes) | key | payload.
+                target_data = False
+                if len(frame) >= 3 and frame[0] == 0:
+                    key_length = struct.unpack_from("!H", frame, 1)[0]
+                    target_data = (
+                        not self._cut.is_set()
+                        and key_length == len(self.cut_key)
+                        and len(frame) >= 3 + key_length
+                        and frame[3 : 3 + key_length] == self.cut_key
+                    )
+
                 if target_data:
                     with self._lock:
                         self._seen.add(direction)
@@ -163,12 +169,14 @@ class FaultProxy:
                             )
                             self._cut.set()
                             self._close_pair(pair)
-                    # The first direction must also drop its frame; neither is forwarded.
+
+                    # Neither DATA frame is forwarded.
                     self._cut.wait(timeout=EXCHANGE_TIMEOUT)
                     return
 
                 destination.sendall(prefix)
                 destination.sendall(frame)
+
         except (OSError, EOFError):
             pass
         finally:
@@ -189,17 +197,13 @@ def worker(node_id: str, endpoints: dict[str, str]) -> tuple[str, list[float]]:
         network.start()
         network.wait_connected(timeout=20)
 
-        for exchange_id in range(N_EXCHANGES):
-            state = np.array([int(node_id), exchange_id], dtype=np.int64)
+        for k in range(N_EXCHANGES):
+            state = np.array([int(node_id), k], dtype=np.int64)
             start = time.perf_counter()
-            received = network.exchange(
-                exchange_id=exchange_id,
-                state=state,
-                timeout=EXCHANGE_TIMEOUT,
-            )
+            received = network.exchange(state, key=k, timeout=EXCHANGE_TIMEOUT)
             elapsed.append(time.perf_counter() - start)
 
-            expected = np.array([int(peer_id), exchange_id], dtype=np.int64)
+            expected = np.array([int(peer_id), k], dtype=np.int64)
             np.testing.assert_array_equal(received[peer_id], expected)
 
         return node_id, elapsed

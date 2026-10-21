@@ -253,7 +253,10 @@ class LiteNetwork:
         logger.info("[%s] Connected to all %d neighbors.", self._node_id, self.degree)
 
     def neighborwise_exchange(
-        self, state_map: dict[str, NDArray]
+        self,
+        state_map: dict[str, NDArray],
+        *,
+        key: object | None = None,
     ) -> dict[str, NDArray]:
         """
         Exchanges the given state map with all neighbor nodes.
@@ -262,6 +265,9 @@ class LiteNetwork:
 
         Args:
             state_map (dict[str, NDArray[np.float64]]): The state map to exchange with neighbors.
+
+            key (object | None, optional): Accepted for API compatibility with Network,
+            but ignored by LiteNetwork. Defaults to None.
 
         Returns:
             dict[str, NDArray[np.float64]]: A dictionary mapping neighbor names to their received state maps.
@@ -291,7 +297,12 @@ class LiteNetwork:
 
         return neighbor_states
 
-    def exchange(self, state: NDArray) -> dict[str, NDArray]:
+    def exchange(
+        self,
+        state: NDArray,
+        *,
+        key: object | None = None,
+    ) -> dict[str, NDArray]:
         """
         Exchanges the given state with all neighbor nodes.
 
@@ -299,6 +310,9 @@ class LiteNetwork:
 
         Args:
             state (NDArray[np.float64]): The state array to exchange with neighbors.
+
+            key (object | None, optional): Accepted for API compatibility with Network,
+            but ignored by LiteNetwork. Defaults to None.
 
         Returns:
             dict[str, NDArray[np.float64]]: A dictionary mapping neighbor names to their received state arrays.
@@ -319,7 +333,12 @@ class LiteNetwork:
 
         return neighbor_states
 
-    def exchange_as_array(self, state: NDArray) -> NDArray:
+    def exchange_as_array(
+        self,
+        state: NDArray,
+        *,
+        key: object | None = None,
+    ) -> NDArray:
         """
         Exchanges the given state with all neighbor nodes and returns their states as a stacked array.
 
@@ -328,6 +347,9 @@ class LiteNetwork:
 
         Args:
             state (NDArray[np.float64]): The state array to exchange with neighbors.
+
+            key (object | None, optional): Accepted for API compatibility with Network,
+            but ignored by LiteNetwork. Defaults to None.
 
         Returns:
             NDArray[np.float64]: A 2D array where each row corresponds to a neighbor's received state array.
@@ -348,7 +370,7 @@ class LiteNetwork:
 
         return np.stack(neighbor_states, axis=0)
 
-    def laplacian(self, state: NDArray) -> NDArray:
+    def laplacian(self, state: NDArray, *, key: object | None = None) -> NDArray:
         """
         Computes the Laplacian of the given state vector based on the states of neighboring nodes.
 
@@ -358,6 +380,9 @@ class LiteNetwork:
 
         Args:
             state (NDArray[float64]): The state vector of the current node.
+
+            key (object | None, optional): Accepted for API compatibility with Network,
+            but ignored by LiteNetwork. Defaults to None.
 
         Returns:
             NDArray[float64]: The Laplacian vector representing the difference between the current state and the average state of its neighbors.
@@ -369,7 +394,7 @@ class LiteNetwork:
 
         return laplacian
 
-    def weighted_mix(self, state: NDArray) -> NDArray:
+    def weighted_mix(self, state: NDArray, *, key: object | None = None) -> NDArray:
         """
         Performs the weighted mixing operation for distributed optimization using the weight matrix W.
 
@@ -383,6 +408,9 @@ class LiteNetwork:
 
         Args:
             state (NDArray[np.float64]): The current state vector of node i.
+
+            key (object | None, optional): Accepted for API compatibility with Network,
+            but ignored by LiteNetwork. Defaults to None.
 
         Returns:
             NDArray[float64]: The mixed state vector corresponding to the i-th row of Wx.

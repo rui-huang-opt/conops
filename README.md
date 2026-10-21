@@ -2,14 +2,30 @@
 
 **ConOps** is a Python package providing graph abstractions and synchronous neighbor-to-neighbor communication primitives for distributed consensus and optimization algorithms.
 
-It offers two communication backends:
+It provides two communication implementations:
 
-- **`Network`** — a Rust-backed TCP implementation with neighbor discovery, exchange matching, and basic connection recovery.
-- **`LiteNetwork`** — a lightweight ZeroMQ implementation for synchronous experiments that do not require application-level message recovery.
+- **`Network`** — a Rust-backed TCP implementation with neighbor discovery, explicit exchange matching, and basic connection recovery.
+- **`LiteNetwork`** — the original Python/ZeroMQ-based network implementation, now renamed to distinguish it from the Rust-backed `Network`. It provides a simpler communication mechanism without explicit message matching or recovery.
+
+Both implementations offer a similar interface for exchanging NumPy arrays and performing common consensus operations.
 
 ## Installation
 
-Install directly from GitHub:
+### Prebuilt Wheels
+
+Precompiled wheels are available from [GitHub Releases](https://github.com/rui-huang-opt/conops/releases).
+
+Download the wheel compatible with your Python version and platform, then install it using:
+
+```bash
+pip install ./conops-*.whl
+```
+
+Prebuilt wheels do not require a Rust toolchain. Currently, wheels are provided for Linux x86-64 with Python 3.10, 3.11, and 3.12.
+
+### Installation from Source
+
+Alternatively, install directly from GitHub:
 
 ```bash
 pip install git+https://github.com/rui-huang-opt/conops.git
@@ -23,7 +39,7 @@ cd conops
 pip install -e .
 ```
 
-**Note:** These commands build the Rust extension from source, so a Rust toolchain is required. For an optimized local build during development, use `maturin develop --release` in an activated virtual environment.
+**Note:** Installing from source requires a Rust toolchain to compile the Rust extension. For an optimized local build during development, use `maturin develop --release` in an activated virtual environment.
 
 ## Undirected Graphs
 
@@ -58,20 +74,6 @@ graph = Graph(nodes, edges)
 print(graph["1"])
 ```
 
-You can visualize the topology with NetworkX and Matplotlib:
-
-```python
-import matplotlib.pyplot as plt
-import networkx as nx
-
-ring = nx.Graph()
-ring.add_nodes_from(nodes)
-ring.add_edges_from(edges)
-
-nx.draw(ring, with_labels=True)
-plt.show()
-```
-
 ![Ring topology](docs/images/ring_topology.png)
 
 ## Deploying a Network
@@ -98,7 +100,17 @@ network.start()
 network.wait_connected(timeout=30)
 ```
 
-Once connected, the node can exchange NumPy arrays and apply operators such as `laplacian()` and `weighted_mix()`. **Each exchange needs an explicitly specified, monotonically increasing `exchange_id`**, and neighboring nodes must use the same ID for the same logical exchange.
+Once connected, the node can exchange NumPy arrays and apply operators such as `laplacian()` and `weighted_mix()`.
+
+Each exchange is identified by a **key**, which must be consistent across neighboring nodes for the same logical exchange. Keys need not be monotonically increasing, but should be unique for distinct exchanges. For example:
+
+```python
+network.exchange(x, key="initial")
+network.laplacian(x, key=(0, "x"))
+network.laplacian(y, key=(0, "y"))
+```
+
+The current implementation supports integer keys, string keys, and `(int, str)` tuples. Neighboring nodes should execute exchanges in a compatible logical order.
 
 When configured manually, `peer_endpoints` maps the local node and its neighbors to endpoints, for example:
 
@@ -151,10 +163,8 @@ try:
     network.wait_connected(timeout=30)
 
     for k in range(50):
-        x = x - alpha * network.laplacian(
-            exchange_id=k,
-            state=x,
-        )
+        x = x - alpha * network.laplacian(x, key=(k, "x"))
+
 finally:
     network.close()
 
@@ -167,16 +177,28 @@ For a complete single-machine example that launches all nodes as separate proces
 
 ## Lightweight Communication
 
-`LiteNetwork` offers the same basic numerical operators through a simpler ZeroMQ communication path, without Rust `Network`'s exchange-ID matching and replay features. Its communication calls do not require an `exchange_id`:
+`LiteNetwork` is the original Python/ZeroMQ network implementation in ConOps, previously provided under the name `Network`. It has been renamed to `LiteNetwork` following the introduction of the Rust-backed implementation.
+
+It uses Pyre for initial neighbor discovery and ZeroMQ ROUTER/DEALER sockets for direct communication. Unlike the Rust-backed `Network`, it does not maintain exchange identifiers, acknowledgment caches, or message replay mechanisms.
+
+`LiteNetwork` retains a simpler synchronous communication design and is suitable for experiments where all nodes follow the same communication sequence and additional recovery mechanisms are unnecessary.
 
 ```python
 from conops import LiteNetwork
 
 network = LiteNetwork(node_id=node_id, neighbors=neighbors)
+
 try:
-    x = x - alpha * network.laplacian(x)
+    for k in range(50):
+        x = x - alpha * network.laplacian(x, key=(k, "x"))
+        # Or x = x - alpha * network.laplacian(x)
+
 finally:
     network.close()
 ```
 
-Choose `Network` for explicit exchange matching and basic recovery, or `LiteNetwork` for simple, tightly synchronized experiments.
+The `key` argument is accepted for API compatibility with `Network`, but is ignored by `LiteNetwork`. Existing calls without a key, such as `network.laplacian(x)`, remain valid.
+
+Both implementations provide the same basic numerical operators, so algorithm code can generally switch between them without changing its communication calls. However, their reliability guarantees differ.
+
+Use **`Network`** when explicit exchange matching and basic connection recovery are needed, or **`LiteNetwork`** when a simpler synchronous communication mechanism is sufficient.

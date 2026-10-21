@@ -1,0 +1,41 @@
+
+name: Release Wheels
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  wheels:
+    needs: test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Build Linux wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: x86_64
+          manylinux: "2_28"
+          args: --release --locked --out dist -i python3.10 python3.11 python3.12
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.whl
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          prerelease: true
