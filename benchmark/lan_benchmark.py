@@ -1,12 +1,22 @@
-"""
-Five-machine LAN benchmark for ConOps Network vs LiteNetwork.
+"""Five-machine LAN benchmark for ConOps Network vs LiteNetwork.
 
-Run this script once on each machine, changing only --node_id.
-All machines must use the same --group_id and benchmark parameters.
-No fixed IPs or extra barriers are used.
+Run once on each machine, changing only --node_id. Every machine must use the
+same --group_id, topology and benchmark parameters. There are no fixed IPs or
+extra barriers.
+
+Profiling options:
+  --profile       Python-level Rust exchange prepare/core/unpack timing.
+                  Requires the previously instrumented conops/network.py.
+  --rust-profile  Rust internal timing (sets CONOPS_RUST_PROFILE=1 before start).
+                  Requires the previously instrumented Rust src/network.rs.
+
+Rust internal timing is printed by CoreNetwork.close() to stderr and currently
+includes warmup exchanges. Python-level timing excludes warmup. Both forms of
+profiling add overhead and should be disabled for definitive speed comparisons.
 """
 
 import argparse
+import os
 import time
 from statistics import median
 from typing import Callable
@@ -20,6 +30,10 @@ EDGES = [("1", "2"), ("2", "3"), ("3", "4"), ("4", "5"), ("5", "1")]
 
 graph = Graph(NODES, EDGES)
 
+# Python profiling: prepare_ns, core_ns, unpack_ns, exchange_count.
+PythonProfile = tuple[int, int, int, int]
+BenchmarkResult = tuple[float, PythonProfile | None]
+
 
 def benchmark_rust(
     node_id: str,
@@ -28,7 +42,8 @@ def benchmark_rust(
     n_iter: int,
     n_state: int,
     n_warmup: int,
-) -> float:
+    python_profile: bool,
+) -> BenchmarkResult:
     network = Network(node_id=node_id, neighbors=neighbors, group_id=group_id)
 
     try:
@@ -42,14 +57,34 @@ def benchmark_rust(
         for k in range(n_warmup):
             network.exchange(x, key=f"warmup-{k}")
 
+        if python_profile:
+            if not hasattr(network, "_profile"):
+                raise RuntimeError(
+                    "--profile requires the instrumented conops/network.py "
+                    "from the Python profiling version."
+                )
+            # Start Python-level accumulation only after warmup.
+            network._profile = [0, 0, 0, 0]
+
         before = time.perf_counter()
         for k in range(n_iter - 1):
             x = x - 0.45 * network.laplacian(x, key=(k, "x"))
             y = y - 0.2 * network.laplacian(y, key=(k, "y"))
+        elapsed = time.perf_counter() - before
 
-        return time.perf_counter() - before
+        stats: PythonProfile | None = None
+        if python_profile:
+            stats = tuple(network._profile)
+            expected_count = 2 * (n_iter - 1)
+            if stats[3] != expected_count:
+                raise RuntimeError(
+                    f"Python profile recorded {stats[3]} exchanges; "
+                    f"expected {expected_count}. Check installed conops/network.py."
+                )
 
+        return elapsed, stats
     finally:
+        # With --rust-profile, the Rust summary is printed here to stderr.
         network.close()
 
 
@@ -60,7 +95,8 @@ def benchmark_lite(
     n_iter: int,
     n_state: int,
     n_warmup: int,
-) -> float:
+    python_profile: bool,
+) -> BenchmarkResult:
     network = LiteNetwork(node_id=node_id, neighbors=neighbors, group_id=group_id)
 
     try:
@@ -75,9 +111,7 @@ def benchmark_lite(
         for _ in range(n_iter - 1):
             x = x - 0.45 * network.laplacian(x)
             y = y - 0.2 * network.laplacian(y)
-
-        return time.perf_counter() - before
-
+        return time.perf_counter() - before, None
     finally:
         network.close()
 
@@ -90,33 +124,52 @@ def main() -> None:
     parser.add_argument("--n_state", type=int, default=1_000_000)
     parser.add_argument("--n_warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Measure Python prepare/core/unpack times (requires profiled network.py)",
+    )
+    parser.add_argument(
+        "--rust-profile",
+        action="store_true",
+        help="Enable Rust internal timings (requires profiled src/network.rs)",
+    )
     args = parser.parse_args()
+
+    if args.n_iter < 2 or args.n_state < 1 or args.n_warmup < 0 or args.repeats < 1:
+        parser.error("Require n_iter >= 2, n_state >= 1, n_warmup >= 0, repeats >= 1")
+
+    # Rust profiler reads this at Network.start(), not at Python module import.
+    # Existing externally supplied CONOPS_RUST_PROFILE is still supported.
+    if args.rust_profile:
+        os.environ["CONOPS_RUST_PROFILE"] = "1"
 
     results: dict[str, list[float]] = {"Rust": [], "Lite": []}
     neighbors = graph[args.node_id]
 
     for repeat in range(args.repeats):
-        benchmarks: list[tuple[str, Callable[..., float]]] = (
+        benchmarks: list[tuple[str, Callable[..., BenchmarkResult]]] = (
             [("Rust", benchmark_rust), ("Lite", benchmark_lite)]
             if repeat % 2 == 0
             else [("Lite", benchmark_lite), ("Rust", benchmark_rust)]
         )
 
         for name, worker in benchmarks:
-            # Must be identical on every machine: never include local PID or hostname.
+            # Identical on all machines; do not include PID or hostname.
             group_id = f"{args.group_id}-{repeat}-{name.lower()}"
             print(
                 f"Node {args.node_id} | Run {repeat + 1:02d} | {name}: connecting...",
                 flush=True,
             )
 
-            elapsed = worker(
+            elapsed, profile_stats = worker(
                 args.node_id,
                 neighbors,
                 group_id,
                 args.n_iter,
                 args.n_state,
                 args.n_warmup,
+                args.profile,
             )
             results[name].append(elapsed)
 
@@ -125,6 +178,17 @@ def main() -> None:
                 f"{name:4s} | elapsed={elapsed:.3f}s",
                 flush=True,
             )
+
+            if profile_stats is not None:
+                prepare_ns, core_ns, unpack_ns, count = profile_stats
+                print(
+                    f"  Rust Python profile ({count} exchanges, average us/call): "
+                    f"prepare={prepare_ns / count / 1_000:.2f}, "
+                    f"core={core_ns / count / 1_000:.2f}, "
+                    f"unpack={unpack_ns / count / 1_000:.2f}; "
+                    f"prepare+unpack={(prepare_ns + unpack_ns) / count / 1_000:.2f}",
+                    flush=True,
+                )
 
     print(f"\nNode {args.node_id} summary (median of local elapsed times)")
     for name, times in results.items():
