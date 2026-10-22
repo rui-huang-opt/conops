@@ -1,18 +1,16 @@
-"""Five-machine LAN benchmark for ConOps Network vs LiteNetwork.
+"""
+Five-machine LAN benchmark for ConOps Network vs LiteNetwork.
 
-Run once on each machine, changing only --node_id. Every machine must use the
-same --group_id, topology and benchmark parameters. There are no fixed IPs or
-extra barriers.
+Run once on each machine, changing only --node_id. Use the same --group_id,
+benchmark parameters, and topology on every machine. No fixed IP or barrier.
 
 Profiling options:
-  --profile       Python-level Rust exchange prepare/core/unpack timing.
-                  Requires the previously instrumented conops/network.py.
-  --rust-profile  Rust internal timing (sets CONOPS_RUST_PROFILE=1 before start).
-                  Requires the previously instrumented Rust src/network.rs.
+  --rust-profile  Rust internal profiling via CONOPS_RUST_PROFILE=1.
+                  Requires instrumented Rust src/network.rs; includes warmup.
+  --lite-profile  Lite encode/send/receive/decode profiling.
+                  Requires instrumented conops/lite.py; excludes warmup.
 
-Rust internal timing is printed by CoreNetwork.close() to stderr and currently
-includes warmup exchanges. Python-level timing excludes warmup. Both forms of
-profiling add overhead and should be disabled for definitive speed comparisons.
+Profiling affects runtime; run without these flags for final comparisons.
 """
 
 import argparse
@@ -30,9 +28,8 @@ EDGES = [("1", "2"), ("2", "3"), ("3", "4"), ("4", "5"), ("5", "1")]
 
 graph = Graph(NODES, EDGES)
 
-# Python profiling: prepare_ns, core_ns, unpack_ns, exchange_count.
-PythonProfile = tuple[int, int, int, int]
-BenchmarkResult = tuple[float, PythonProfile | None]
+# LiteProfileStats is obtained via LiteNetwork.profile_stats().
+BenchmarkResult = tuple[float, object | None]
 
 
 def benchmark_rust(
@@ -42,7 +39,7 @@ def benchmark_rust(
     n_iter: int,
     n_state: int,
     n_warmup: int,
-    python_profile: bool,
+    lite_profile: bool,
 ) -> BenchmarkResult:
     network = Network(node_id=node_id, neighbors=neighbors, group_id=group_id)
 
@@ -57,34 +54,14 @@ def benchmark_rust(
         for k in range(n_warmup):
             network.exchange(x, key=f"warmup-{k}")
 
-        if python_profile:
-            if not hasattr(network, "_profile"):
-                raise RuntimeError(
-                    "--profile requires the instrumented conops/network.py "
-                    "from the Python profiling version."
-                )
-            # Start Python-level accumulation only after warmup.
-            network._profile = [0, 0, 0, 0]
-
         before = time.perf_counter()
         for k in range(n_iter - 1):
             x = x - 0.45 * network.laplacian(x, key=(k, "x"))
             y = y - 0.2 * network.laplacian(y, key=(k, "y"))
-        elapsed = time.perf_counter() - before
 
-        stats: PythonProfile | None = None
-        if python_profile:
-            stats = tuple(network._profile)
-            expected_count = 2 * (n_iter - 1)
-            if stats[3] != expected_count:
-                raise RuntimeError(
-                    f"Python profile recorded {stats[3]} exchanges; "
-                    f"expected {expected_count}. Check installed conops/network.py."
-                )
-
-        return elapsed, stats
+        return time.perf_counter() - before, None
     finally:
-        # With --rust-profile, the Rust summary is printed here to stderr.
+        # Rust internal profiling prints on close() when enabled.
         network.close()
 
 
@@ -95,7 +72,7 @@ def benchmark_lite(
     n_iter: int,
     n_state: int,
     n_warmup: int,
-    python_profile: bool,
+    lite_profile: bool,
 ) -> BenchmarkResult:
     network = LiteNetwork(node_id=node_id, neighbors=neighbors, group_id=group_id)
 
@@ -107,13 +84,51 @@ def benchmark_lite(
         for _ in range(n_warmup):
             network.exchange(x)
 
+        if lite_profile:
+            network.start_profile()  # Reset after warmup.
+
         before = time.perf_counter()
         for _ in range(n_iter - 1):
             x = x - 0.45 * network.laplacian(x)
             y = y - 0.2 * network.laplacian(y)
-        return time.perf_counter() - before, None
+        elapsed = time.perf_counter() - before
+
+        stats = network.stop_profile() if lite_profile else None
+        if stats is not None:
+            expected_count = 2 * (n_iter - 1)
+            if stats.count != expected_count:
+                raise RuntimeError(
+                    f"Lite profile recorded {stats.count} exchanges; "
+                    f"expected {expected_count}."
+                )
+
+        return elapsed, stats
     finally:
         network.close()
+
+
+def print_lite_profile(stats: object) -> None:
+    # Only called after checking the instrumented LiteNetwork was installed.
+    count = stats.count
+    us = lambda ns: ns / count / 1_000
+    print(f"  Lite profile ({count} exchanges, average us/call):", flush=True)
+    print(f"    encode/prepare         {us(stats.encode_ns):9.2f} us", flush=True)
+    print(f"    send_multipart         {us(stats.send_ns):9.2f} us", flush=True)
+    print(f"    recv_multipart waiting {us(stats.recv_wait_ns):9.2f} us", flush=True)
+    print(f"    decode                 {us(stats.decode_ns):9.2f} us", flush=True)
+    print(f"    exchange total         {us(stats.total_ns):9.2f} us", flush=True)
+    for peer in sorted(stats.peer_recv_wait_ns):
+        print(
+            f"    peer {peer}: recv wait {us(stats.peer_recv_wait_ns[peer]):.2f} us, "
+            f"recv completed at {us(stats.peer_recv_complete_ns[peer]):.2f} us "
+            f"since exchange start",
+            flush=True,
+        )
+    print(
+        "    Note: send times measure ZeroMQ submission, not delivery; "
+        "receives are sequential and may be already queued.",
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -125,22 +140,27 @@ def main() -> None:
     parser.add_argument("--n_warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
-        "--profile",
-        action="store_true",
-        help="Measure Python prepare/core/unpack times (requires profiled network.py)",
-    )
-    parser.add_argument(
         "--rust-profile",
         action="store_true",
-        help="Enable Rust internal timings (requires profiled src/network.rs)",
+        help="Enable Rust internal profiling (requires profiled src/network.rs)",
+    )
+    parser.add_argument(
+        "--lite-profile",
+        action="store_true",
+        help="Enable Lite encode/send/receive/decode profiling (requires profiled lite.py)",
     )
     args = parser.parse_args()
 
     if args.n_iter < 2 or args.n_state < 1 or args.n_warmup < 0 or args.repeats < 1:
         parser.error("Require n_iter >= 2, n_state >= 1, n_warmup >= 0, repeats >= 1")
 
-    # Rust profiler reads this at Network.start(), not at Python module import.
-    # Existing externally supplied CONOPS_RUST_PROFILE is still supported.
+    # Fail before connecting, not mid-run where other nodes could wait forever.
+    if args.lite_profile and not all(
+        callable(getattr(LiteNetwork, name, None))
+        for name in ("start_profile", "stop_profile")
+    ):
+        parser.error("--lite-profile requires the instrumented conops/lite.py")
+
     if args.rust_profile:
         os.environ["CONOPS_RUST_PROFILE"] = "1"
 
@@ -155,7 +175,6 @@ def main() -> None:
         )
 
         for name, worker in benchmarks:
-            # Identical on all machines; do not include PID or hostname.
             group_id = f"{args.group_id}-{repeat}-{name.lower()}"
             print(
                 f"Node {args.node_id} | Run {repeat + 1:02d} | {name}: connecting...",
@@ -169,7 +188,7 @@ def main() -> None:
                 args.n_iter,
                 args.n_state,
                 args.n_warmup,
-                args.profile,
+                args.lite_profile,
             )
             results[name].append(elapsed)
 
@@ -179,16 +198,8 @@ def main() -> None:
                 flush=True,
             )
 
-            if profile_stats is not None:
-                prepare_ns, core_ns, unpack_ns, count = profile_stats
-                print(
-                    f"  Rust Python profile ({count} exchanges, average us/call): "
-                    f"prepare={prepare_ns / count / 1_000:.2f}, "
-                    f"core={core_ns / count / 1_000:.2f}, "
-                    f"unpack={unpack_ns / count / 1_000:.2f}; "
-                    f"prepare+unpack={(prepare_ns + unpack_ns) / count / 1_000:.2f}",
-                    flush=True,
-                )
+            if name == "Lite" and profile_stats is not None:
+                print_lite_profile(profile_stats)
 
     print(f"\nNode {args.node_id} summary (median of local elapsed times)")
     for name, times in results.items():

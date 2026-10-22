@@ -1,4 +1,6 @@
 import uuid
+from dataclasses import dataclass, field
+from time import perf_counter_ns
 from json import loads
 from logging import getLogger
 from typing import KeysView
@@ -12,6 +14,25 @@ from numpy.typing import NDArray
 from .transform import Transform, Identity
 
 logger = getLogger(__name__)
+
+
+@dataclass
+class LiteProfileStats:
+    """Cumulative timings of successful LiteNetwork.exchange() calls.
+
+    Times are local wall-clock durations, not network-only latency. Receive
+    calls are sequential; per-peer wait reflects the order in which DEALER
+    sockets are read, not necessarily the arrival order on the wire.
+    """
+
+    count: int = 0
+    encode_ns: int = 0
+    send_ns: int = 0
+    recv_wait_ns: int = 0
+    decode_ns: int = 0
+    total_ns: int = 0
+    peer_recv_wait_ns: dict[str, int] = field(default_factory=dict)
+    peer_recv_complete_ns: dict[str, int] = field(default_factory=dict)
 
 
 class LiteNetwork:
@@ -80,6 +101,8 @@ class LiteNetwork:
         self._weight = 1.0 - sum(neighbors.values())
 
         self._neighbor_id_bytes = [j.encode("utf-8") for j in self._neighbors]
+        # None keeps the original non-profiled exchange path unchanged.
+        self._profile: LiteProfileStats | None = None
 
         self._out_socket = self._context.socket(zmq.ROUTER)
         self._out_socket.setsockopt(zmq.LINGER, 0)
@@ -131,6 +154,35 @@ class LiteNetwork:
     @property
     def weights(self) -> dict[str, float]:
         return self._neighbors
+
+    def start_profile(self) -> None:
+        """Reset and enable local timings for subsequent exchange() calls."""
+        self._profile = LiteProfileStats(
+            peer_recv_wait_ns={peer: 0 for peer in self._neighbors},
+            peer_recv_complete_ns={peer: 0 for peer in self._neighbors},
+        )
+
+    def profile_stats(self) -> LiteProfileStats | None:
+        """Return a snapshot of accumulated timings, or None if disabled."""
+        p = self._profile
+        if p is None:
+            return None
+        return LiteProfileStats(
+            count=p.count,
+            encode_ns=p.encode_ns,
+            send_ns=p.send_ns,
+            recv_wait_ns=p.recv_wait_ns,
+            decode_ns=p.decode_ns,
+            total_ns=p.total_ns,
+            peer_recv_wait_ns=p.peer_recv_wait_ns.copy(),
+            peer_recv_complete_ns=p.peer_recv_complete_ns.copy(),
+        )
+
+    def stop_profile(self) -> LiteProfileStats | None:
+        """Return final snapshot and disable subsequent profiling."""
+        stats = self.profile_stats()
+        self._profile = None
+        return stats
 
     def close(self) -> None:
         self._out_socket.close(linger=0)
@@ -320,17 +372,51 @@ class LiteNetwork:
         if self._out_socket is None:
             raise RuntimeError("FastNetwork is not bound")
 
+        profile = self._profile
+        if profile is None:
+            meta, payload = self._transform.encode(state)
+            payload = np.ascontiguousarray(payload)
+            for j_bytes in self._neighbor_id_bytes:
+                msgs = [j_bytes, meta, payload]
+                self._out_socket.send_multipart(msgs, copy=False)
+
+            neighbor_states: dict[str, NDArray[np.float64]] = {}
+            for j, dealer in self._dealers.items():
+                meta, payload = dealer.recv_multipart()
+                neighbor_states[j] = self._transform.decode(meta, payload)
+
+            return neighbor_states
+
+        # Profiling enabled: timestamps are kept in Python and accumulated;
+        # no per-exchange printing and no barrier are added.
+        t0 = perf_counter_ns()
         meta, payload = self._transform.encode(state)
         payload = np.ascontiguousarray(payload)
+        t1 = perf_counter_ns()
+
         for j_bytes in self._neighbor_id_bytes:
             msgs = [j_bytes, meta, payload]
             self._out_socket.send_multipart(msgs, copy=False)
+        t2 = perf_counter_ns()
 
         neighbor_states: dict[str, NDArray[np.float64]] = {}
         for j, dealer in self._dealers.items():
+            recv_start = perf_counter_ns()
             meta, payload = dealer.recv_multipart()
+            recv_end = perf_counter_ns()
             neighbor_states[j] = self._transform.decode(meta, payload)
+            decode_end = perf_counter_ns()
 
+            profile.recv_wait_ns += recv_end - recv_start
+            profile.decode_ns += decode_end - recv_end
+            profile.peer_recv_wait_ns[j] += recv_end - recv_start
+            profile.peer_recv_complete_ns[j] += recv_end - t0
+
+        t3 = perf_counter_ns()
+        profile.count += 1
+        profile.encode_ns += t1 - t0
+        profile.send_ns += t2 - t1
+        profile.total_ns += t3 - t0
         return neighbor_states
 
     def laplacian(self, state: NDArray, *, key: object | None = None) -> NDArray:
