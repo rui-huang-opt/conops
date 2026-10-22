@@ -52,6 +52,11 @@ def benchmark(
     n_warmup: int,
     peer_endpoints: dict[str, str] | None,
 ) -> float:
+    if peer_endpoints is not None:
+        peer_endpoints = {
+            peer_id: peer_endpoints[peer_id] for peer_id in (node_id, *neighbors)
+        }
+
     if kind == "Rust":
         network = Network(
             node_id=node_id,
