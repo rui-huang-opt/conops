@@ -36,6 +36,10 @@ TOPOLOGIES = {
     ),
     "local": (["1", "2"], [("1", "2")]),
     "remote": (["1", "5"], [("1", "5")]),
+    "triangle": (
+        ["1", "4", "5"],
+        [("1", "4"), ("4", "5"), ("5", "1")],
+    ),
 }
 
 # LiteProfileStats is obtained via LiteNetwork.profile_stats().
