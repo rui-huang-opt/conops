@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     net::{SocketAddr, SocketAddrV4},
 };
+use std::time::Duration;
 
 use mdns_sd::{Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 
@@ -107,11 +108,14 @@ impl Discovery {
         }
     }
 
-    /// Stop advertising and browsing.
     pub fn close(self) -> mdns_sd::Result<()> {
         self.daemon.stop_browse(SERVICE_TYPE)?;
-        let _ = self.daemon.unregister(&self.fullname)?;
-        let _ = self.daemon.shutdown()?;
+
+        let unregister = self.daemon.unregister(&self.fullname)?;
+        let _ = unregister.recv_timeout(Duration::from_secs(2));
+
+        let shutdown = self.daemon.shutdown()?;
+        let _ = shutdown.recv_timeout(Duration::from_secs(2));
 
         Ok(())
     }
