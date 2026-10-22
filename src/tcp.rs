@@ -3,6 +3,9 @@ use std::io;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+const SMALL_FRAME_CAPACITY: usize = 512;
+const LENGTH_PREFIX_SIZE: usize = 4;
+
 pub async fn send_message<W>(writer: &mut W, data: &[u8], max_size: usize) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -13,10 +16,24 @@ where
             "Message too large",
         ));
     }
+
     let len = u32::try_from(data.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Message length exceeds u32"))?;
-    writer.write_u32(len).await?;
-    writer.write_all(data).await?;
+
+    if data.len() <= SMALL_FRAME_CAPACITY - LENGTH_PREFIX_SIZE {
+        // 小消息：栈上拼接，一次写入
+        let mut buffer = [0u8; SMALL_FRAME_CAPACITY];
+
+        buffer[..4].copy_from_slice(&len.to_be_bytes());
+        buffer[4..4 + data.len()].copy_from_slice(data);
+
+        writer.write_all(&buffer[..4 + data.len()]).await?;
+    } else {
+        // 大消息：原有路径，无额外完整复制
+        writer.write_u32(len).await?;
+        writer.write_all(data).await?;
+    }
+
     Ok(())
 }
 
