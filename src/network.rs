@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     ffi::{c_int, c_void},
     future, io, ptr,
     sync::mpsc,
@@ -39,14 +39,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-// Per-neighbor unacknowledged DATA is bounded (shared Bytes, no payload copy).
-const MAX_UNACKED_MESSAGES: usize = 4;
 const DEFAULT_MAX_UNACKED_BYTES: usize = 128 * 1024 * 1024;
 
 /// Limits are per Network instance, not global process settings.
 #[derive(Clone, Copy)]
 struct NetworkConfig {
     max_message_size: usize,
+    // Kept for API compatibility during this experiment; there is no unacked cache.
     max_unacked_bytes: usize,
     max_early_bytes: usize,
 }
@@ -258,11 +257,6 @@ fn start_connect(
 }
 
 enum PeerEvent {
-    Ack {
-        peer_id: String,
-        session: u64,
-        key: Bytes,
-    },
     Data {
         peer_id: String,
         session: u64,
@@ -288,57 +282,17 @@ struct PendingExchange {
     reply: ExchangeReply,
 }
 
-/// Messages not yet ACKed by this neighbor. Preserve the send order on replay.
-/// Only a few frames are retained; a VecDeque keeps this simpler than two maps.
-#[derive(Default)]
-struct UnackedMessages {
-    frames: VecDeque<(Bytes, Bytes)>,
-    bytes: usize,
-}
-
-impl UnackedMessages {
-    fn check_capacity(
-        &self,
-        key: &Bytes,
-        frame_size: usize,
-        max_unacked_bytes: usize,
-    ) -> Result<(), String> {
-        if self.frames.iter().any(|(stored, _)| stored == key) {
-            return Err("Exchange key is already awaiting ACK".into());
-        }
-        if self.frames.len() >= MAX_UNACKED_MESSAGES
-            || frame_size > max_unacked_bytes.saturating_sub(self.bytes)
-        {
-            return Err("Unacknowledged message cache full".into());
-        }
-        Ok(())
-    }
-
-    // Caller must have passed check_capacity() on the same event-loop iteration.
-    fn insert(&mut self, key: Bytes, frame: Bytes) {
-        self.bytes += frame.len();
-        self.frames.push_back((key, frame));
-    }
-
-    fn acknowledge(&mut self, key: &Bytes) {
-        if let Some(index) = self.frames.iter().position(|(stored, _)| stored == key) {
-            let (_, frame) = self.frames.remove(index).expect("checked index");
-            self.bytes -= frame.len();
-        }
-    }
-}
-
 async fn handshake(mut stream: TcpStream, my_id: &str) -> io::Result<(String, TcpStream)> {
     stream.set_nodelay(true)?;
-    // The DATA/ACK frame layout changed: reject peers speaking the old protocol.
-    let hello = format!("HELLO2 {my_id}");
+    // Experimental DATA-only protocol. Reject connections from ACK-enabled builds.
+    let hello = format!("HELLO3 {my_id}");
     send_message(&mut stream, hello.as_bytes(), HELLO_MAX_SIZE).await?;
 
     let buffer = recv_message(&mut stream, HELLO_MAX_SIZE).await?;
     let text = std::str::from_utf8(&buffer)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in HELLO"))?;
     let peer_id = text
-        .strip_prefix("HELLO2 ")
+        .strip_prefix("HELLO3 ")
         .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid HELLO"))?;
 
@@ -374,19 +328,6 @@ async fn read_peer(
                         session,
                         key,
                         data: payload,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            Ok(message::Message::Ack { key }) => {
-                if events
-                    .send(PeerEvent::Ack {
-                        peer_id: peer_id.clone(),
-                        session,
-                        key,
                     })
                     .await
                     .is_err()
@@ -519,13 +460,14 @@ fn disconnect_peer(
     peers: &mut HashMap<String, PeerConnection>,
     peer_id: &str,
     reason: &str,
-) {
+) -> bool {
     if let Some(peer) = peers.remove(peer_id) {
         peer.reader.abort();
         peer.writer.abort();
-        // Keep pending Batch and early data: the connection can return.
-        // The Python exchange deadline still limits how long we wait.
         info!("[{node_id}] Disconnected from {peer_id}: {reason}");
+        true
+    } else {
+        false
     }
 }
 
@@ -582,8 +524,7 @@ async fn run_network(
     let mut peers: HashMap<String, PeerConnection> = HashMap::new();
     let mut next_session = 0u64;
     let mut connecting = HashSet::<String>::new();
-    let mut connected_before = HashSet::<String>::new();
-    // Static endpoints are known from startup, so the existing retry and replay paths work without mDNS.
+    // Static endpoints can still be retried without mDNS, but lost DATA is not replayed.
     // Only the smaller node ID initiates connections.
     let mut addresses: HashMap<String, Vec<String>> = peer_endpoints
         .unwrap_or_default()
@@ -596,8 +537,6 @@ async fn run_network(
     let mut pending: Option<PendingExchange> = None;
     let mut early = EarlyMessages::new(EARLY_MAX_MESSAGES, config.max_early_bytes);
     let mut completed = CompletedKeys::new(COMPLETED_MAX_KEYS);
-    // Retain unacknowledged DATA separately for each peer, even while disconnected.
-    let mut unacked = HashMap::<String, UnackedMessages>::new();
 
     loop {
         tokio::select! {
@@ -689,15 +628,6 @@ async fn run_network(
                         let mut permits = Vec::with_capacity(peers.len());
                         if error.is_none() {
                             for (peer_id, peer) in &peers {
-                                let frame = data.for_peer(peer_id).expect("checked neighborwise peers");
-                                if let Err(err) = unacked.entry(peer_id.clone())
-                                    .or_default().check_capacity(
-                                        &key, frame.len(), config.max_unacked_bytes,
-                                    )
-                                {
-                                    error = Some(format!("Cannot retain message for {peer_id}: {err}"));
-                                    break;
-                                }
                                 match peer.sender.try_reserve() {
                                     Ok(permit) => permits.push((peer_id.clone(), permit)),
                                     Err(err) => {
@@ -711,12 +641,11 @@ async fn run_network(
                         if let Some(reason) = error {
                             let _ = reply.send(Err(reason));
                         } else {
-                            // Cache before queuing: a queued write is NOT proof of delivery.
+                            // Reserve all peer queues before submitting any DATA.
                             // Broadcast clones share one allocation; neighborwise frames differ.
+                            // A queued write is NOT proof of delivery (no application-level ACK).
                             for (peer_id, permit) in permits {
                                 let frame = data.for_peer(&peer_id).expect("checked neighborwise peers");
-                                unacked.entry(peer_id).or_default()
-                                    .insert(key.clone(), frame.clone());
                                 permit.send(frame.clone());
                             }
                             pending = Some(PendingExchange { batch, reply });
@@ -740,31 +669,16 @@ async fn run_network(
                         if established.outgoing {
                             connecting.remove(&peer_id);
                         }
-                        let is_reconnect = connected_before.contains(&peer_id);
                         let old_count = peers.len();
                         register_peer(
                             &node_id, neighbors.as_ref(), &mut peers,
                             &mut next_session, config.max_message_size, &event_tx, established,
                         );
                         if peers.len() != old_count {
-                            connected_before.insert(peer_id.clone());
-                            if is_reconnect {
-                                // Replay only DATA for which this particular peer's ACK
-                                // has not arrived. Replay follows the original send order.
-                                let sender = &peers.get(&peer_id).expect("new peer").sender;
-                                let result = unacked.get(&peer_id).map(|messages| {
-                                    messages.frames.iter().try_for_each(|(_, frame)| {
-                                        sender.try_send(frame.clone()).map_err(|err| err.to_string())
-                                    })
-                                });
-                                if let Some(Err(err)) = result {
-                                    disconnect_peer(&node_id, &mut peers, &peer_id,
-                                        &format!("Replay queue error: {err}"));
-                                }
-                            } else {
-                                // Only an entirely new neighbor changes the topology.
-                                fail_exchange(&mut pending, &mut completed, "Peer set changed during exchange".into());
-                            }
+                            // A reconnected peer has no replay state. Do not mix sessions
+                            // in an exchange that was already in progress.
+                            fail_exchange(&mut pending, &mut completed,
+                                format!("Peer set changed during exchange ({peer_id})"));
                         }
                     }
                     Some(ConnectEvent::Failed { peer_id, reason, reply }) => {
@@ -836,58 +750,43 @@ async fn run_network(
 
             event = event_rx.recv() => {
                 match event {
-                    Some(PeerEvent::Ack { peer_id, session, key }) => {
-                        if peers.get(&peer_id).is_some_and(|p| p.session == session) {
-                            if let Some(messages) = unacked.get_mut(&peer_id) {
-                                messages.acknowledge(&key);
-                            }
-                        }
-                    }
                     Some(PeerEvent::Data { peer_id, session, key, data }) => {
                         if !peers.get(&peer_id).is_some_and(|p| p.session == session) {
                             continue; // event from a previous TCP session
                         }
 
-                        let accepted = if pending.as_ref().is_some_and(|p| p.batch.key() == &key) {
-                            match pending.as_mut().expect("checked pending")
+                        if pending.as_ref().is_some_and(|p| p.batch.key() == &key) {
+                            if let Err(err) = pending.as_mut().expect("checked pending")
                                 .batch.insert(peer_id.clone(), data)
                             {
-                                Ok(_) => true, // a duplicate is still acknowledged
-                                Err(err) => {
-                                    fail_exchange(&mut pending, &mut completed, format!(
-                                        "Invalid exchange message from {peer_id}: {err}"
-                                    ));
-                                    false
-                                }
+                                fail_exchange(&mut pending, &mut completed, format!(
+                                    "Invalid exchange message from {peer_id}: {err}"
+                                ));
+                            } else {
+                                complete_exchange(&mut pending, &mut completed);
                             }
                         } else if completed.contains(&key) {
-                            // Already completed / cancelled: discard and ACK the duplicate.
-                            true
+                            // Ignore duplicates and late messages from completed/cancelled keys.
                         } else {
-                            // Not yet started locally: ACK only after bounded cache accepts it.
-                            match early.insert(key.clone(), peer_id.clone(), data) {
-                                Ok(_) => true,
-                                Err(err) => {
-                                    disconnect_peer(&node_id, &mut peers, &peer_id, err);
-                                    false
+                            // Store valid future DATA in a bounded early-message cache.
+                            if let Err(err) = early.insert(key.clone(), peer_id.clone(), data) {
+                                if disconnect_peer(&node_id, &mut peers, &peer_id, err) {
+                                    early.remove_peer(&peer_id);
+                                    fail_exchange(&mut pending, &mut completed,
+                                        format!("Peer {peer_id} disconnected: {err}"));
                                 }
                             }
-                        };
-
-                        if accepted {
-                            // ACK is asynchronous: exchange() does not wait for it.
-                            if let Some(peer) = peers.get(&peer_id) {
-                                if let Err(err) = peer.sender.try_send(message::encode_ack(&key)) {
-                                    disconnect_peer(&node_id, &mut peers, &peer_id,
-                                        &format!("Cannot queue ACK: {err}"));
-                                }
-                            }
-                            complete_exchange(&mut pending, &mut completed);
                         }
                     }
                     Some(PeerEvent::Closed { peer_id, session, reason }) => {
                         if peers.get(&peer_id).is_some_and(|p| p.session == session) {
-                            disconnect_peer(&node_id, &mut peers, &peer_id, &reason);
+                            if disconnect_peer(&node_id, &mut peers, &peer_id, &reason) {
+                                // With no replay, an in-flight exchange cannot safely
+                                // resume on a new TCP session.
+                                early.remove_peer(&peer_id);
+                                fail_exchange(&mut pending, &mut completed,
+                                    format!("Peer {peer_id} disconnected: {reason}"));
+                            }
                         }
                     }
                     None => break,
@@ -1343,82 +1242,8 @@ impl CoreNetwork {
 }
 
 #[cfg(test)]
-mod ack_tests {
+mod config_tests {
     use super::*;
-
-    #[test]
-    fn unacked_is_bounded_and_ack_releases_space() {
-        let mut cache = UnackedMessages::default();
-        let frame = Bytes::from_static(b"data");
-
-        for exchange_id in 1..=MAX_UNACKED_MESSAGES as u64 {
-            let key = Bytes::copy_from_slice(&exchange_id.to_be_bytes());
-            cache
-                .check_capacity(&key, frame.len(), DEFAULT_MAX_UNACKED_BYTES)
-                .unwrap();
-            cache.insert(key, frame.clone());
-        }
-        assert!(
-            cache
-                .check_capacity(
-                    &Bytes::from_static(b"100"),
-                    frame.len(),
-                    DEFAULT_MAX_UNACKED_BYTES
-                )
-                .is_err()
-        );
-        assert_eq!(cache.bytes, 4 * MAX_UNACKED_MESSAGES);
-
-        cache.acknowledge(&Bytes::copy_from_slice(&1u64.to_be_bytes()));
-        cache.acknowledge(&Bytes::copy_from_slice(&1u64.to_be_bytes())); // duplicate ACK is harmless
-        assert_eq!(cache.bytes, 4 * (MAX_UNACKED_MESSAGES - 1));
-        cache
-            .check_capacity(
-                &Bytes::from_static(b"100"),
-                frame.len(),
-                DEFAULT_MAX_UNACKED_BYTES,
-            )
-            .unwrap();
-        cache.insert(Bytes::from_static(b"100"), frame);
-    }
-
-    #[test]
-    fn unacked_replays_in_send_order() {
-        let mut cache = UnackedMessages::default();
-        cache.insert(Bytes::from_static(b"z"), Bytes::from_static(b"first"));
-        cache.insert(Bytes::from_static(b"a"), Bytes::from_static(b"second"));
-        assert_eq!(cache.frames[0].0.as_ref(), b"z");
-        assert_eq!(cache.frames[1].0.as_ref(), b"a");
-    }
-
-    #[test]
-    fn unacked_checks_total_bytes() {
-        let mut cache = UnackedMessages::default();
-        // Simulate a nearly-full cache without allocating a huge test buffer.
-        cache.bytes = DEFAULT_MAX_UNACKED_BYTES - 1;
-        assert!(
-            cache
-                .check_capacity(&Bytes::from_static(b"11"), 2, DEFAULT_MAX_UNACKED_BYTES)
-                .is_err()
-        );
-        cache
-            .check_capacity(&Bytes::from_static(b"11"), 1, DEFAULT_MAX_UNACKED_BYTES)
-            .unwrap();
-    }
-
-    #[test]
-    fn unacked_uses_instance_budget() {
-        let mut cache = UnackedMessages::default();
-        cache.insert(Bytes::from_static(b"old"), Bytes::from_static(b"abcd"));
-        assert!(
-            cache
-                .check_capacity(&Bytes::from_static(b"new"), 3, 6)
-                .is_err()
-        );
-        cache
-            .check_capacity(&Bytes::from_static(b"new"), 3, 7)
-            .unwrap();
-    }
 
     #[test]
     fn configurable_limits_are_validated() {
