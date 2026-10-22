@@ -13,22 +13,10 @@ where
             "Message too large",
         ));
     }
-
     let len = u32::try_from(data.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Message length exceeds u32"))?;
-
-    if data.len() <= 508 {
-        let mut buffer = [0u8; 512];
-
-        buffer[..4].copy_from_slice(&len.to_be_bytes());
-        buffer[4..4 + data.len()].copy_from_slice(data);
-
-        writer.write_all(&buffer[..4 + data.len()]).await?;
-    } else {
-        writer.write_u32(len).await?;
-        writer.write_all(data).await?;
-    }
-
+    writer.write_u32(len).await?;
+    writer.write_all(data).await?;
     Ok(())
 }
 
