@@ -1,6 +1,7 @@
 import argparse
 import time
 from statistics import median
+from typing import cast
 
 import numpy.random as npr
 
@@ -40,6 +41,7 @@ def benchmark(
 
     try:
         if kind == "Rust":
+            network = cast(Network, network)
             network.start()
             network.wait_connected(timeout=120)
 
