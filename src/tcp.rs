@@ -1,6 +1,6 @@
 use std::io;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub async fn send_message<W>(writer: &mut W, data: &[u8], max_size: usize) -> io::Result<()>
@@ -13,10 +13,15 @@ where
             "Message too large",
         ));
     }
+
     let len = u32::try_from(data.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Message length exceeds u32"))?;
-    writer.write_u32(len).await?;
-    writer.write_all(data).await?;
+
+    let header = len.to_be_bytes();
+    let mut frame = Buf::chain(&header[..], data);
+
+    writer.write_all_buf(&mut frame).await?;
+
     Ok(())
 }
 
