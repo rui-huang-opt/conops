@@ -43,36 +43,6 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_UNACKED_MESSAGES: usize = 4;
 const DEFAULT_MAX_UNACKED_BYTES: usize = 128 * 1024 * 1024;
 
-// Experimental scheduler settings. Both knobs are read once at start(), so
-// the original behavior can be reproduced without rebuilding the extension:
-//   CONOPS_TOKIO_EVENT_INTERVAL=61 CONOPS_TOKIO_SPLIT_PEER_IO=1
-// The optimized defaults favor prompt I/O polling and one task per peer.
-const DEFAULT_TOKIO_EVENT_INTERVAL: u32 = 8;
-
-#[derive(Clone, Copy)]
-struct SchedulerConfig {
-    event_interval: u32,
-    fuse_peer_io: bool,
-}
-
-impl SchedulerConfig {
-    fn from_env() -> Self {
-        let event_interval = std::env::var("CONOPS_TOKIO_EVENT_INTERVAL")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(DEFAULT_TOKIO_EVENT_INTERVAL);
-        let fuse_peer_io = !matches!(
-            std::env::var("CONOPS_TOKIO_SPLIT_PEER_IO").as_deref(),
-            Ok("1")
-        );
-        Self {
-            event_interval,
-            fuse_peer_io,
-        }
-    }
-}
-
 /// Limits are per Network instance, not global process settings.
 #[derive(Clone, Copy)]
 struct NetworkConfig {
@@ -308,30 +278,9 @@ enum PeerEvent {
 
 struct PeerConnection {
     sender: async_mpsc::Sender<Bytes>,
-    tasks: PeerTasks,
+    reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
     session: u64,
-}
-
-// Split is kept only as an A/B baseline. Both variants use the same protocol,
-// queues and socket halves; they differ solely in Tokio task scheduling.
-enum PeerTasks {
-    Fused(JoinHandle<()>),
-    Split {
-        reader: JoinHandle<()>,
-        writer: JoinHandle<()>,
-    },
-}
-
-impl PeerTasks {
-    fn abort(&self) {
-        match self {
-            Self::Fused(task) => task.abort(),
-            Self::Split { reader, writer } => {
-                reader.abort();
-                writer.abort();
-            }
-        }
-    }
 }
 
 struct PendingExchange {
@@ -481,33 +430,6 @@ async fn write_peer(
     }
 }
 
-// The same pinned read future is polled for the entire connection lifetime:
-// a select! iteration NEVER drops a partially read TCP frame. Only a terminal
-// read/write error, shutdown, or disconnect cancels either direction.
-async fn run_peer_io(
-    reader: OwnedReadHalf,
-    writer: OwnedWriteHalf,
-    outbound: async_mpsc::Receiver<Bytes>,
-    peer_id: String,
-    session: u64,
-    max_message_size: usize,
-    events: async_mpsc::Sender<PeerEvent>,
-) {
-    let read = read_peer(
-        reader,
-        peer_id.clone(),
-        session,
-        max_message_size,
-        events.clone(),
-    );
-    let write = write_peer(writer, outbound, peer_id, session, max_message_size, events);
-    tokio::pin!(read, write);
-    tokio::select! {
-        _ = &mut read => {},
-        _ = &mut write => {},
-    }
-}
-
 fn register_peer(
     node_id: &str,
     expected: Option<&HashSet<String>>,
@@ -515,7 +437,6 @@ fn register_peer(
     next_session: &mut u64,
     max_message_size: usize,
     events: &async_mpsc::Sender<PeerEvent>,
-    fuse_peer_io: bool,
     established: Established,
 ) {
     let Established {
@@ -537,43 +458,28 @@ fn register_peer(
         let (reader, writer) = stream.into_split();
         let (sender, outbound) = async_mpsc::channel(SEND_QUEUE_SIZE);
 
-        let tasks = if fuse_peer_io {
-            // One Tokio task is woken for either socket readiness or outbound
-            // queue data instead of scheduling separate read/write tasks.
-            PeerTasks::Fused(tokio::spawn(run_peer_io(
-                reader,
-                writer,
-                outbound,
-                peer_id.clone(),
-                session,
-                max_message_size,
-                events.clone(),
-            )))
-        } else {
-            // Baseline: exactly the original independent read/write tasks.
-            let reader = tokio::spawn(read_peer(
-                reader,
-                peer_id.clone(),
-                session,
-                max_message_size,
-                events.clone(),
-            ));
-            let writer = tokio::spawn(write_peer(
-                writer,
-                outbound,
-                peer_id.clone(),
-                session,
-                max_message_size,
-                events.clone(),
-            ));
-            PeerTasks::Split { reader, writer }
-        };
+        let reader_task = tokio::spawn(read_peer(
+            reader,
+            peer_id.clone(),
+            session,
+            max_message_size,
+            events.clone(),
+        ));
+        let writer_task = tokio::spawn(write_peer(
+            writer,
+            outbound,
+            peer_id.clone(),
+            session,
+            max_message_size,
+            events.clone(),
+        ));
 
         peers.insert(
             peer_id.clone(),
             PeerConnection {
                 sender,
-                tasks,
+                reader: reader_task,
+                writer: writer_task,
                 session,
             },
         );
@@ -615,7 +521,8 @@ fn disconnect_peer(
     reason: &str,
 ) {
     if let Some(peer) = peers.remove(peer_id) {
-        peer.tasks.abort();
+        peer.reader.abort();
+        peer.writer.abort();
         // Keep pending Batch and early data: the connection can return.
         // The Python exchange deadline still limits how long we wait.
         info!("[{node_id}] Disconnected from {peer_id}: {reason}");
@@ -629,7 +536,6 @@ async fn run_network(
     group_id: String,
     peer_endpoints: Option<HashMap<String, String>>,
     config: NetworkConfig,
-    fuse_peer_io: bool,
     mut stop_rx: oneshot::Receiver<()>,
     mut command_rx: async_mpsc::UnboundedReceiver<Command>,
     ready_tx: mpsc::SyncSender<Result<(), String>>,
@@ -838,8 +744,7 @@ async fn run_network(
                         let old_count = peers.len();
                         register_peer(
                             &node_id, neighbors.as_ref(), &mut peers,
-                            &mut next_session, config.max_message_size, &event_tx,
-                            fuse_peer_io, established,
+                            &mut next_session, config.max_message_size, &event_tx, established,
                         );
                         if peers.len() != old_count {
                             connected_before.insert(peer_id.clone());
@@ -993,7 +898,8 @@ async fn run_network(
 
     fail_exchange(&mut pending, &mut completed, "Network stopped".into());
     for (_, peer) in peers.drain() {
-        peer.tasks.abort();
+        peer.reader.abort();
+        peer.writer.abort();
     }
     if let Some(discovery) = discovery {
         if let Err(err) = discovery.close() {
@@ -1200,10 +1106,8 @@ impl CoreNetwork {
         let group_id = self.group_id.clone();
         let peer_endpoints = self.peer_endpoints.clone();
         let config = self.config;
-        let scheduling = SchedulerConfig::from_env();
         let worker = thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
-                .event_interval(scheduling.event_interval)
                 .enable_all()
                 .build();
             match rt {
@@ -1214,7 +1118,6 @@ impl CoreNetwork {
                     group_id,
                     peer_endpoints,
                     config,
-                    scheduling.fuse_peer_io,
                     stop_rx,
                     command_rx,
                     ready_tx,
