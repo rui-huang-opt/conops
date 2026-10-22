@@ -2,11 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_int, c_void},
     future, io, ptr,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-        mpsc,
-    },
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -80,87 +76,8 @@ impl NetworkConfig {
     }
 }
 
-// Opt-in diagnostic instrumentation. Enable before Network.start() with
-// CONOPS_RUST_PROFILE=1. Disabled by default: no per-message time sampling.
-#[derive(Default)]
-struct TimingStat {
-    count: AtomicU64,
-    nanos: AtomicU64,
-}
-
-impl TimingStat {
-    fn record(&self, elapsed: Duration) {
-        self.nanos.fetch_add(
-            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        self.count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn print(&self, name: &str) {
-        let count = self.count.load(Ordering::Relaxed);
-        if count > 0 {
-            let mean_us = self.nanos.load(Ordering::Relaxed) as f64 / count as f64 / 1_000.0;
-            eprintln!("  {name:25} {mean_us:10.2} us  (n={count})");
-        }
-    }
-}
-
-#[derive(Default)]
-struct RustProfile {
-    api_encode: TimingStat,
-    command_queue: TimingStat,
-    command_dispatch: TimingStat,
-    exchange_inflight: TimingStat,
-    data_event_queue: TimingStat,
-    ack_event_queue: TimingStat,
-    data_send_queue: TimingStat,
-    ack_send_queue: TimingStat,
-    data_tcp_write: TimingStat,
-    ack_tcp_write: TimingStat,
-    python_reply_wakeup: TimingStat,
-    python_result_wrap: TimingStat,
-}
-
-impl RustProfile {
-    fn print(&self, node_id: &str) {
-        eprintln!("\n[Rust {node_id}] Core profile: mean per event (warmup + timed calls)");
-        self.api_encode.print("PyO3 encode (per exchange)");
-        self.command_queue.print("command queue delay");
-        self.command_dispatch.print("command handler / enqueue");
-        self.exchange_inflight.print("exchange in-flight wait");
-        self.data_send_queue.print("DATA writer queue delay");
-        self.data_tcp_write.print("DATA TCP write_all");
-        self.data_event_queue.print("DATA receive event queue");
-        self.ack_send_queue.print("ACK writer queue delay");
-        self.ack_tcp_write.print("ACK TCP write_all");
-        self.ack_event_queue.print("ACK receive event queue");
-        self.python_reply_wakeup.print("reply -> Python wakeup");
-        self.python_result_wrap.print("PyO3 result memoryviews");
-        eprintln!("  Note: overlapping phases; do not add the averages together.");
-        eprintln!("  In-flight includes peer/network wait; TCP write ends at local write_all.\n");
-    }
-}
-
-/// The sender queue preserves TCP message order; profiling metadata is local only.
-struct OutboundFrame {
-    payload: Bytes,
-    queued_at: Option<Instant>,
-    is_ack: bool,
-}
-
-impl OutboundFrame {
-    fn new(payload: Bytes, is_ack: bool, profiling: bool) -> Self {
-        Self {
-            payload,
-            queued_at: profiling.then(Instant::now),
-            is_ack,
-        }
-    }
-}
-
 type Reply = mpsc::Sender<Result<(), String>>;
-type ExchangeResult = Result<(HashMap<String, Bytes>, Option<Instant>), String>;
+type ExchangeResult = Result<HashMap<String, Bytes>, String>;
 type ExchangeReply = mpsc::Sender<ExchangeResult>;
 
 /// A read-only Python buffer backed by a Rust Bytes allocation.
@@ -235,7 +152,6 @@ enum Command {
         key: Bytes,
         data: ExchangeData,
         reply: ExchangeReply,
-        enqueued_at: Option<Instant>,
     },
     CancelExchange {
         key: Bytes,
@@ -346,14 +262,12 @@ enum PeerEvent {
         peer_id: String,
         session: u64,
         key: Bytes,
-        event_at: Option<Instant>,
     },
     Data {
         peer_id: String,
         session: u64,
         key: Bytes,
         data: Bytes,
-        event_at: Option<Instant>,
     },
     Closed {
         peer_id: String,
@@ -363,7 +277,7 @@ enum PeerEvent {
 }
 
 struct PeerConnection {
-    sender: async_mpsc::Sender<OutboundFrame>,
+    sender: async_mpsc::Sender<Bytes>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
     session: u64,
@@ -372,7 +286,6 @@ struct PeerConnection {
 struct PendingExchange {
     batch: Batch,
     reply: ExchangeReply,
-    started_at: Option<Instant>,
 }
 
 /// Messages not yet ACKed by this neighbor. Preserve the send order on replay.
@@ -445,7 +358,6 @@ async fn read_peer(
     session: u64,
     max_message_size: usize,
     events: async_mpsc::Sender<PeerEvent>,
-    profile: Option<Arc<RustProfile>>,
 ) {
     loop {
         let received = async {
@@ -462,7 +374,6 @@ async fn read_peer(
                         session,
                         key,
                         data: payload,
-                        event_at: profile.as_ref().map(|_| Instant::now()),
                     })
                     .await
                     .is_err()
@@ -476,7 +387,6 @@ async fn read_peer(
                         peer_id: peer_id.clone(),
                         session,
                         key,
-                        event_at: profile.as_ref().map(|_| Instant::now()),
                     })
                     .await
                     .is_err()
@@ -500,36 +410,14 @@ async fn read_peer(
 
 async fn write_peer(
     mut writer: OwnedWriteHalf,
-    mut outbound: async_mpsc::Receiver<OutboundFrame>,
+    mut outbound: async_mpsc::Receiver<Bytes>,
     peer_id: String,
     session: u64,
     max_message_size: usize,
     events: async_mpsc::Sender<PeerEvent>,
-    profile: Option<Arc<RustProfile>>,
 ) {
-    while let Some(frame) = outbound.recv().await {
-        let write_start = profile.as_ref().map(|_| Instant::now());
-        if let (Some(stats), Some(start), Some(queued)) =
-            (profile.as_deref(), write_start, frame.queued_at)
-        {
-            let target = if frame.is_ack {
-                &stats.ack_send_queue
-            } else {
-                &stats.data_send_queue
-            };
-            target.record(start.saturating_duration_since(queued));
-        }
-
-        let result = send_message(&mut writer, &frame.payload, max_message_size).await;
-        if let (Some(stats), Some(start)) = (profile.as_deref(), write_start) {
-            let target = if frame.is_ack {
-                &stats.ack_tcp_write
-            } else {
-                &stats.data_tcp_write
-            };
-            target.record(start.elapsed());
-        }
-        if let Err(err) = result {
+    while let Some(data) = outbound.recv().await {
+        if let Err(err) = send_message(&mut writer, &data, max_message_size).await {
             let _ = events
                 .send(PeerEvent::Closed {
                     peer_id,
@@ -549,7 +437,6 @@ fn register_peer(
     next_session: &mut u64,
     max_message_size: usize,
     events: &async_mpsc::Sender<PeerEvent>,
-    profile: Option<&Arc<RustProfile>>,
     established: Established,
 ) {
     let Established {
@@ -577,7 +464,6 @@ fn register_peer(
             session,
             max_message_size,
             events.clone(),
-            profile.cloned(),
         ));
         let writer_task = tokio::spawn(write_peer(
             writer,
@@ -586,7 +472,6 @@ fn register_peer(
             session,
             max_message_size,
             events.clone(),
-            profile.cloned(),
         ));
 
         peers.insert(
@@ -617,11 +502,7 @@ fn fail_exchange(
     }
 }
 
-fn complete_exchange(
-    pending: &mut Option<PendingExchange>,
-    completed: &mut CompletedKeys,
-    profile: Option<&RustProfile>,
-) {
+fn complete_exchange(pending: &mut Option<PendingExchange>, completed: &mut CompletedKeys) {
     if pending
         .as_ref()
         .is_some_and(|active| active.batch.is_complete())
@@ -629,11 +510,7 @@ fn complete_exchange(
         let active = pending.take().expect("checked pending exchange");
         completed.insert(active.batch.key().clone());
         let results = active.batch.take().expect("checked complete batch");
-        if let (Some(stats), Some(start)) = (profile, active.started_at) {
-            stats.exchange_inflight.record(start.elapsed());
-        }
-        let sent_at = profile.map(|_| Instant::now());
-        let _ = active.reply.send(Ok((results, sent_at)));
+        let _ = active.reply.send(Ok(results));
     }
 }
 
@@ -662,7 +539,6 @@ async fn run_network(
     mut stop_rx: oneshot::Receiver<()>,
     mut command_rx: async_mpsc::UnboundedReceiver<Command>,
     ready_tx: mpsc::SyncSender<Result<(), String>>,
-    profile: Option<Arc<RustProfile>>,
 ) {
     // Bind all interfaces so discovered LAN addresses can reach the listener.
     // Use only in trusted networks; this is not an authenticated service.
@@ -768,13 +644,7 @@ async fn run_network(
                         ids.sort();
                         let _ = reply.send(ids);
                     }
-                    Some(Command::Exchange { key, data, reply, enqueued_at }) => {
-                        let dispatch_at = profile.as_ref().map(|_| Instant::now());
-                        if let (Some(stats), Some(at), Some(queued)) =
-                            (profile.as_deref(), dispatch_at, enqueued_at)
-                        {
-                            stats.command_queue.record(at.saturating_duration_since(queued));
-                        }
+                    Some(Command::Exchange { key, data, reply }) => {
                         if pending.is_some() {
                             let _ = reply.send(Err("Another exchange is in progress".into()));
                             continue;
@@ -847,17 +717,10 @@ async fn run_network(
                                 let frame = data.for_peer(&peer_id).expect("checked neighborwise peers");
                                 unacked.entry(peer_id).or_default()
                                     .insert(key.clone(), frame.clone());
-                                permit.send(OutboundFrame::new(frame.clone(), false, profile.is_some()));
+                                permit.send(frame.clone());
                             }
-                            pending = Some(PendingExchange {
-                                batch,
-                                reply,
-                                started_at: dispatch_at,
-                            });
-                            complete_exchange(&mut pending, &mut completed, profile.as_deref());
-                            if let (Some(stats), Some(start)) = (profile.as_deref(), dispatch_at) {
-                                stats.command_dispatch.record(start.elapsed());
-                            }
+                            pending = Some(PendingExchange { batch, reply });
+                            complete_exchange(&mut pending, &mut completed);
                         }
                     }
                     Some(Command::CancelExchange { key }) => {
@@ -881,8 +744,7 @@ async fn run_network(
                         let old_count = peers.len();
                         register_peer(
                             &node_id, neighbors.as_ref(), &mut peers,
-                            &mut next_session, config.max_message_size, &event_tx,
-                            profile.as_ref(), established,
+                            &mut next_session, config.max_message_size, &event_tx, established,
                         );
                         if peers.len() != old_count {
                             connected_before.insert(peer_id.clone());
@@ -892,8 +754,7 @@ async fn run_network(
                                 let sender = &peers.get(&peer_id).expect("new peer").sender;
                                 let result = unacked.get(&peer_id).map(|messages| {
                                     messages.frames.iter().try_for_each(|(_, frame)| {
-                                        sender.try_send(OutboundFrame::new(frame.clone(), false, profile.is_some()))
-                                            .map_err(|err| err.to_string())
+                                        sender.try_send(frame.clone()).map_err(|err| err.to_string())
                                     })
                                 });
                                 if let Some(Err(err)) = result {
@@ -975,20 +836,14 @@ async fn run_network(
 
             event = event_rx.recv() => {
                 match event {
-                    Some(PeerEvent::Ack { peer_id, session, key, event_at }) => {
-                        if let (Some(stats), Some(at)) = (profile.as_deref(), event_at) {
-                            stats.ack_event_queue.record(at.elapsed());
-                        }
+                    Some(PeerEvent::Ack { peer_id, session, key }) => {
                         if peers.get(&peer_id).is_some_and(|p| p.session == session) {
                             if let Some(messages) = unacked.get_mut(&peer_id) {
                                 messages.acknowledge(&key);
                             }
                         }
                     }
-                    Some(PeerEvent::Data { peer_id, session, key, data, event_at }) => {
-                        if let (Some(stats), Some(at)) = (profile.as_deref(), event_at) {
-                            stats.data_event_queue.record(at.elapsed());
-                        }
+                    Some(PeerEvent::Data { peer_id, session, key, data }) => {
                         if !peers.get(&peer_id).is_some_and(|p| p.session == session) {
                             continue; // event from a previous TCP session
                         }
@@ -1022,14 +877,12 @@ async fn run_network(
                         if accepted {
                             // ACK is asynchronous: exchange() does not wait for it.
                             if let Some(peer) = peers.get(&peer_id) {
-                                if let Err(err) = peer.sender.try_send(OutboundFrame::new(
-                                    message::encode_ack(&key), true, profile.is_some(),
-                                )) {
+                                if let Err(err) = peer.sender.try_send(message::encode_ack(&key)) {
                                     disconnect_peer(&node_id, &mut peers, &peer_id,
                                         &format!("Cannot queue ACK: {err}"));
                                 }
                             }
-                            complete_exchange(&mut pending, &mut completed, profile.as_deref());
+                            complete_exchange(&mut pending, &mut completed);
                         }
                     }
                     Some(PeerEvent::Closed { peer_id, session, reason }) => {
@@ -1067,7 +920,6 @@ pub struct CoreNetwork {
     commands: Option<async_mpsc::UnboundedSender<Command>>,
     stop_tx: Option<oneshot::Sender<()>>,
     worker: Option<thread::JoinHandle<()>>,
-    profile: Option<Arc<RustProfile>>,
 }
 
 impl CoreNetwork {
@@ -1101,7 +953,6 @@ impl CoreNetwork {
                 key: key.clone(),
                 data,
                 reply,
-                enqueued_at: self.profile.as_ref().map(|_| Instant::now()),
             })
             .map_err(|_| PyRuntimeError::new_err("Network worker has stopped"))?;
 
@@ -1139,19 +990,12 @@ impl CoreNetwork {
             }
         };
         match result {
-            Ok(Ok((messages, sent_at))) => {
-                if let (Some(stats), Some(at)) = (self.profile.as_deref(), sent_at) {
-                    stats.python_reply_wakeup.record(at.elapsed());
-                }
-                let wrap_start = self.profile.as_ref().map(|_| Instant::now());
+            Ok(Ok(messages)) => {
                 let mut received = HashMap::with_capacity(messages.len());
                 for (peer_id, payload) in messages {
                     let owner = Py::new(py, ReceivedBuffer { data: payload })?;
                     let view = PyMemoryView::from(owner.bind(py).as_any())?;
                     received.insert(peer_id, view.unbind());
-                }
-                if let (Some(stats), Some(at)) = (self.profile.as_deref(), wrap_start) {
-                    stats.python_result_wrap.record(at.elapsed());
                 }
                 Ok(received)
             }
@@ -1245,7 +1089,6 @@ impl CoreNetwork {
             commands: None,
             stop_tx: None,
             worker: None,
-            profile: None,
         })
     }
 
@@ -1256,16 +1099,6 @@ impl CoreNetwork {
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (command_tx, command_rx) = async_mpsc::unbounded_channel();
-        // Read only once at start; all hot-path sampling is then gated on Option.
-        let profile = if matches!(
-            std::env::var("CONOPS_RUST_PROFILE").as_deref(),
-            Ok("1" | "true" | "yes")
-        ) {
-            Some(Arc::new(RustProfile::default()))
-        } else {
-            None
-        };
-        let worker_profile = profile.clone();
 
         let node_id = self.node_id.clone();
         let port = self.port;
@@ -1288,7 +1121,6 @@ impl CoreNetwork {
                     stop_rx,
                     command_rx,
                     ready_tx,
-                    worker_profile,
                 )),
                 Err(err) => {
                     let _ = ready_tx.send(Err(err.to_string()));
@@ -1301,7 +1133,6 @@ impl CoreNetwork {
                 self.commands = Some(command_tx);
                 self.stop_tx = Some(stop_tx);
                 self.worker = Some(worker);
-                self.profile = profile;
                 Ok(())
             }
             other => {
@@ -1418,12 +1249,8 @@ impl CoreNetwork {
         if size > self.config.max_message_size {
             return Err(PyValueError::new_err("Message too large"));
         }
-        let encode_started = self.profile.as_ref().map(|_| Instant::now());
         let encoded = message::encode_state(key, meta, payload)
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        if let (Some(stats), Some(at)) = (self.profile.as_deref(), encode_started) {
-            stats.api_encode.record(at.elapsed());
-        }
         self.exchange_encoded(
             py,
             Bytes::copy_from_slice(key),
@@ -1450,7 +1277,6 @@ impl CoreNetwork {
             }
         }
 
-        let encode_started = self.profile.as_ref().map(|_| Instant::now());
         let mut frames = HashMap::with_capacity(states.len());
         for (peer_id, state) in states.iter() {
             let peer_id: String = peer_id.extract()?;
@@ -1494,9 +1320,6 @@ impl CoreNetwork {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
             frames.insert(peer_id, frame);
         }
-        if let (Some(stats), Some(at)) = (self.profile.as_deref(), encode_started) {
-            stats.api_encode.record(at.elapsed());
-        }
 
         self.exchange_encoded(
             py,
@@ -1514,9 +1337,6 @@ impl CoreNetwork {
         if let Some(worker) = self.worker.take() {
             py.detach(move || worker.join())
                 .map_err(|_| PyRuntimeError::new_err("Network worker panicked"))?;
-        }
-        if let Some(stats) = self.profile.take() {
-            stats.print(&self.node_id);
         }
         Ok(())
     }
