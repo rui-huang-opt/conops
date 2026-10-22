@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, IoSlice};
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -24,7 +24,11 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     }
 }
 
-// The wire format and DATA send path are deliberately unchanged.
+/// Write a length-prefixed TCP frame without concatenating the header and body.
+///
+/// On a vectored-capable socket, the common case submits both slices with one
+/// write_vectored() call. A successful write can still be partial, so the
+/// remaining header/body bytes must be written before returning.
 pub async fn send_message<W>(writer: &mut W, data: &[u8], max_size: usize) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -37,8 +41,31 @@ where
     }
     let len = u32::try_from(data.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Message length exceeds u32"))?;
-    writer.write_u32(len).await?;
-    writer.write_all(data).await?;
+
+    let header = len.to_be_bytes();
+    let slices = [IoSlice::new(&header), IoSlice::new(data)];
+    let written = loop {
+        match writer.write_vectored(&slices).await {
+            Ok(n) => break n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    };
+    if written == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "Failed to write TCP frame",
+        ));
+    }
+
+    if written < header.len() {
+        // The initial write stopped inside the 4-byte prefix.
+        writer.write_all(&header[written..]).await?;
+        writer.write_all(data).await?;
+    } else {
+        // The prefix is complete; send only the unconsumed payload bytes.
+        writer.write_all(&data[written - header.len()..]).await?;
+    }
     Ok(())
 }
 
@@ -167,5 +194,109 @@ mod tests {
         });
         assert_eq!(r.recv(64).await.unwrap().as_ref(), b"abc");
         assert_eq!(r.recv(64).await.unwrap().as_ref(), b"d");
+    }
+    /// Records writes and simulates kernels accepting only a small prefix.
+    struct LimitedWriter {
+        output: Vec<u8>,
+        max_per_write: usize,
+        vectored_calls: usize,
+        scalar_calls: usize,
+    }
+
+    impl LimitedWriter {
+        fn new(max_per_write: usize) -> Self {
+            Self {
+                output: Vec::new(),
+                max_per_write,
+                vectored_calls: 0,
+                scalar_calls: 0,
+            }
+        }
+    }
+
+    impl AsyncWrite for LimitedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.scalar_calls += 1;
+            let count = buf.len().min(self.max_per_write);
+            self.output.extend_from_slice(&buf[..count]);
+            Poll::Ready(Ok(count))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            self.vectored_calls += 1;
+            let mut remaining = self.max_per_write;
+            for buf in bufs {
+                let count = buf.len().min(remaining);
+                self.output.extend_from_slice(&buf[..count]);
+                remaining -= count;
+                if remaining == 0 {
+                    break;
+                }
+            }
+            Poll::Ready(Ok(self.max_per_write - remaining))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn vectored_write_handles_partial_header_and_payload() {
+        let payload = b"abcde";
+        let mut expected = (payload.len() as u32).to_be_bytes().to_vec();
+        expected.extend_from_slice(payload);
+
+        for limit in [1, 2, 3, 4, 5, 6, 8, usize::MAX] {
+            let mut writer = LimitedWriter::new(limit);
+            send_message(&mut writer, payload, 64).await.unwrap();
+            assert_eq!(writer.output, expected, "write limit: {limit}");
+            assert_eq!(writer.vectored_calls, 1, "write limit: {limit}");
+        }
+    }
+
+    #[tokio::test]
+    async fn vectored_write_handles_empty_payload() {
+        let mut writer = LimitedWriter::new(4);
+        send_message(&mut writer, b"", 0).await.unwrap();
+        assert_eq!(writer.output, [0, 0, 0, 0]);
+        assert_eq!(writer.vectored_calls, 1);
+        assert_eq!(writer.scalar_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn vectored_write_zero_is_an_error() {
+        let mut writer = LimitedWriter::new(0);
+        let err = send_message(&mut writer, b"xyz", 32).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+    }
+
+    #[tokio::test]
+    async fn vectored_write_large_payload_without_frame_concatenation() {
+        let payload = vec![23u8; 256 * 1024];
+        let mut writer = LimitedWriter::new(usize::MAX);
+        send_message(&mut writer, &payload, payload.len())
+            .await
+            .unwrap();
+        assert_eq!(&writer.output[..4], &(payload.len() as u32).to_be_bytes());
+        assert_eq!(&writer.output[4..], payload.as_slice());
+        assert_eq!(writer.vectored_calls, 1);
+        assert_eq!(writer.scalar_calls, 0);
     }
 }
