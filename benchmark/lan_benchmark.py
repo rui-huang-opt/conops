@@ -16,37 +16,55 @@ EDGES = [
     ("5", "1"),
 ]
 
+# NUC: 1, 2, 3
+# HP EliteBook: 4, 5
 PEER_ENDPOINTS = {
-    "1": "192.168.55.51:50051",
-    "2": "192.168.55.51:50052",
-    "3": "192.168.55.51:50053",
-    "4": "192.168.55.63:50051",
-    "5": "192.168.55.63:50052",
+    "1": "tcp://192.168.55.51:50051",
+    "2": "tcp://192.168.55.51:50052",
+    "3": "tcp://192.168.55.51:50053",
+    "4": "tcp://192.168.55.63:50051",
+    "5": "tcp://192.168.55.63:50052",
 }
 
 
+def endpoints_for_run(
+    repeat: int,
+    kind: str,
+) -> dict[str, str]:
+    # Each backend/repeat uses a distinct set of ports.
+    offset = (2 * repeat + (0 if kind == "Rust" else 1)) * 10
+
+    endpoints = {}
+    for node_id, endpoint in PEER_ENDPOINTS.items():
+        host, port = endpoint.rsplit(":", 1)
+        endpoints[node_id] = f"{host}:{int(port) + offset}"
+
+    return endpoints
+
+
 def benchmark(
-    kind,
-    node_id,
-    neighbors,
-    group_id,
-    n_state,
-    n_iter,
-    n_warmup,
-):
+    kind: str,
+    node_id: str,
+    neighbors: dict[str, float],
+    group_id: str,
+    n_state: int,
+    n_iter: int,
+    n_warmup: int,
+    peer_endpoints: dict[str, str] | None,
+) -> float:
     if kind == "Rust":
         network = Network(
             node_id=node_id,
             neighbors=neighbors,
             group_id=group_id,
-            peer_endpoints=PEER_ENDPOINTS,
+            peer_endpoints=peer_endpoints,
         )
     else:
         network = LiteNetwork(
             node_id=node_id,
             neighbors=neighbors,
             group_id=group_id,
-            peer_endpoints=PEER_ENDPOINTS,
+            peer_endpoints=peer_endpoints,
         )
 
     try:
@@ -60,20 +78,13 @@ def benchmark(
         y = npr.uniform(-100.0, 100.0, n_state)
 
         for k in range(n_warmup):
-            if kind == "Rust":
-                network.exchange(x, key=f"warmup-{k}")
-            else:
-                network.exchange(x, key=f"warmup-{k}")
+            network.exchange(x, key=f"warmup-{k}")
 
         start = time.perf_counter()
 
         for k in range(n_iter - 1):
-            if kind == "Rust":
-                x = x - 0.45 * network.laplacian(x, key=(k, "x"))
-                y = y - 0.20 * network.laplacian(y, key=(k, "y"))
-            else:
-                x = x - 0.45 * network.laplacian(x, key=(k, "x"))
-                y = y - 0.20 * network.laplacian(y, key=(k, "y"))
+            x = x - 0.45 * network.laplacian(x, key=(k, "x"))
+            y = y - 0.20 * network.laplacian(y, key=(k, "y"))
 
         return time.perf_counter() - start
 
@@ -81,14 +92,44 @@ def benchmark(
         network.close()
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="ConOps five-node ring LAN benchmark")
-    parser.add_argument("--node_id", required=True, choices=NODES)
-    parser.add_argument("--group_id", default="lan-benchmark")
-    parser.add_argument("--n_state", type=int, default=5)
-    parser.add_argument("--n_iter", type=int, default=1000)
-    parser.add_argument("--n_warmup", type=int, default=10)
-    parser.add_argument("--repeats", type=int, default=5)
+
+    parser.add_argument(
+        "--node_id",
+        required=True,
+        choices=NODES,
+    )
+    parser.add_argument(
+        "--group_id",
+        default="lan-benchmark",
+    )
+    parser.add_argument(
+        "--n_state",
+        type=int,
+        default=5,
+    )
+    parser.add_argument(
+        "--n_iter",
+        type=int,
+        default=1000,
+    )
+    parser.add_argument(
+        "--n_warmup",
+        type=int,
+        default=10,
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=5,
+    )
+    parser.add_argument(
+        "--discovery",
+        choices=("static", "mdns"),
+        default="static",
+        help="static: fixed IP; mdns: automatic discovery",
+    )
 
     args = parser.parse_args()
 
@@ -96,10 +137,15 @@ def main():
         parser.error("Invalid benchmark parameters")
 
     neighbors = Graph(NODES, EDGES)[args.node_id]
-    results = {"Rust": [], "Lite": []}
+
+    results = {
+        "Rust": [],
+        "Lite": [],
+    }
 
     print(
         f"Node {args.node_id} | ring | "
+        f"discovery={args.discovery} | "
         f"neighbors={list(neighbors)} | "
         f"group={args.group_id}",
         flush=True,
@@ -111,10 +157,19 @@ def main():
         for kind in order:
             group_id = f"{args.group_id}-{repeat}-{kind.lower()}"
 
+            peer_endpoints = (
+                endpoints_for_run(repeat, kind) if args.discovery == "static" else None
+            )
+
             print(
                 f"Node {args.node_id} | "
                 f"Run {repeat + 1:02d} | "
-                f"{kind}: connecting...",
+                f"{kind}: connecting..."
+                + (
+                    f" | endpoint={peer_endpoints[args.node_id]}"
+                    if peer_endpoints
+                    else ""
+                ),
                 flush=True,
             )
 
@@ -126,7 +181,9 @@ def main():
                 args.n_state,
                 args.n_iter,
                 args.n_warmup,
+                peer_endpoints,
             )
+
             results[kind].append(elapsed)
 
             print(
