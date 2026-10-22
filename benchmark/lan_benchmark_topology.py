@@ -44,6 +44,10 @@ TOPOLOGIES = {
         ["1", "4", "5"],
         [("1", "5"), ("4", "5")],
     ),
+    "chain": (
+        ["1", "4", "5"],
+        [("1", "4"), ("4", "5")],
+    ),
 }
 
 # LiteProfileStats is obtained via LiteNetwork.profile_stats().
