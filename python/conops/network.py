@@ -1,4 +1,5 @@
 import struct
+from time import perf_counter_ns
 from collections.abc import KeysView, Mapping
 from urllib.parse import urlsplit
 
@@ -122,6 +123,9 @@ class Network:
         self._node_id = node_id
         self._neighbors = dict(neighbors)
         self._transform = transform if transform is not None else Identity()
+        # Optional benchmark-only timing: [prepare_ns, core_ns, unpack_ns, calls].
+        # None leaves the normal, uninstrumented communication path unchanged.
+        self._profile: list[int] | None = None
 
         peer_endpoints_ = None
         if peer_endpoints is not None:
@@ -234,15 +238,41 @@ class Network:
         timeout: float | None = None,
     ) -> dict[str, NDArray]:
         """Exchange ``state`` with all fixed neighbors using a semantic key."""
+        profile = self._profile
+        if profile is None:
+            # Preserve the original fast path when profiling is disabled.
+            encoded_key = _encode_exchange_key(key)
+            meta, payload = self._prepare(state)
+            incoming = self._core.exchange_array(
+                encoded_key,
+                meta,
+                payload,
+                timeout=timeout,
+            )
+            return {peer_id: self._unpack(data) for peer_id, data in incoming.items()}
+
+        # Profile only the timed exchange calls (warmup is excluded by caller).
+        t0 = perf_counter_ns()
         encoded_key = _encode_exchange_key(key)
         meta, payload = self._prepare(state)
+        t1 = perf_counter_ns()
+
         incoming = self._core.exchange_array(
             encoded_key,
             meta,
             payload,
             timeout=timeout,
         )
-        return {peer_id: self._unpack(data) for peer_id, data in incoming.items()}
+        t2 = perf_counter_ns()
+
+        received = {peer_id: self._unpack(data) for peer_id, data in incoming.items()}
+        t3 = perf_counter_ns()
+
+        profile[0] += t1 - t0
+        profile[1] += t2 - t1
+        profile[2] += t3 - t2
+        profile[3] += 1
+        return received
 
     def neighborwise_exchange(
         self,
