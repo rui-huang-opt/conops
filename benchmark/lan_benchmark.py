@@ -16,6 +16,14 @@ EDGES = [
     ("5", "1"),
 ]
 
+PEER_ENDPOINTS = {
+    "1": "192.168.55.51:50051",
+    "2": "192.168.55.51:50052",
+    "3": "192.168.55.51:50053",
+    "4": "192.168.55.63:50051",
+    "5": "192.168.55.63:50052",
+}
+
 
 def benchmark(
     kind,
@@ -31,12 +39,14 @@ def benchmark(
             node_id=node_id,
             neighbors=neighbors,
             group_id=group_id,
+            peer_endpoints=PEER_ENDPOINTS,
         )
     else:
         network = LiteNetwork(
             node_id=node_id,
             neighbors=neighbors,
             group_id=group_id,
+            peer_endpoints=PEER_ENDPOINTS,
         )
 
     try:
