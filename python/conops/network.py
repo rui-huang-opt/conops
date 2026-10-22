@@ -284,7 +284,7 @@ class Network:
         received = self.exchange(state, key=key, timeout=timeout)
         result = len(self._neighbors) * state
         for neighbor_state in received.values():
-            result = result - neighbor_state
+            result -= neighbor_state
         return result
 
     def weighted_mix(
@@ -298,5 +298,5 @@ class Network:
         received = self.exchange(state, key=key, timeout=timeout)
         result = (1.0 - sum(self._neighbors.values())) * state
         for peer_id, neighbor_state in received.items():
-            result = result + self._neighbors[peer_id] * neighbor_state
+            result += self._neighbors[peer_id] * neighbor_state
         return result
