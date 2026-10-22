@@ -3,15 +3,16 @@ use std::io;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 // The outer TCP frame still uses a 4-byte big-endian length prefix.
-// Experimental inner frame: type (1 byte) | key length (2 bytes) | key | payload.
-// TYPE_ACK is deliberately unsupported in this benchmark-only protocol.
+// Inner frame: type (1 byte) | key length (2 bytes) | key | optional payload.
 const TYPE_DATA: u8 = 0;
+const TYPE_ACK: u8 = 1;
 pub const HEADER_SIZE: usize = 3;
 pub const MAX_KEY_SIZE: usize = 256;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Message {
     Data { key: Bytes, payload: Bytes },
+    Ack { key: Bytes },
 }
 
 fn key_length(key: &[u8]) -> io::Result<u16> {
@@ -47,8 +48,18 @@ pub fn encode_state(key: &[u8], meta: &[u8], payload: &[u8]) -> io::Result<Bytes
     Ok(buffer.freeze())
 }
 
-/// Consumes an owned DATA frame. Copy the key only, not the large payload.
-/// Copying the key avoids pinning the payload allocation in key history.
+/// Encode an ACK for a previously validated exchange key.
+pub fn encode_ack(key: &[u8]) -> Bytes {
+    debug_assert!(!key.is_empty() && key.len() <= MAX_KEY_SIZE);
+    let mut buffer = BytesMut::with_capacity(HEADER_SIZE + key.len());
+    buffer.put_u8(TYPE_ACK);
+    buffer.put_u16(key.len() as u16);
+    buffer.extend_from_slice(key);
+    buffer.freeze()
+}
+
+/// Consumes an owned frame. Copy only DATA keys, not large payloads.
+/// A DATA key slice would pin the entire large allocation in history.
 pub fn decode(mut buffer: Bytes) -> io::Result<Message> {
     if buffer.len() < HEADER_SIZE {
         return Err(io::Error::new(
@@ -58,13 +69,6 @@ pub fn decode(mut buffer: Bytes) -> io::Result<Message> {
     }
 
     let kind = buffer.get_u8();
-    if kind != TYPE_DATA {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Unknown message type",
-        ));
-    }
-
     let key_len = buffer.get_u16() as usize;
     if key_len == 0 || key_len > MAX_KEY_SIZE || buffer.len() < key_len {
         return Err(io::Error::new(
@@ -72,12 +76,30 @@ pub fn decode(mut buffer: Bytes) -> io::Result<Message> {
             "Invalid exchange key length",
         ));
     }
-    let key = Bytes::copy_from_slice(&buffer[..key_len]);
-    buffer.advance(key_len);
-    Ok(Message::Data {
-        key,
-        payload: buffer,
-    })
+    let key = if kind == TYPE_DATA {
+        let key = Bytes::copy_from_slice(&buffer[..key_len]);
+        buffer.advance(key_len);
+        key
+    } else {
+        // ACK frames are tiny, so keeping their backing allocation is fine.
+        buffer.split_to(key_len)
+    };
+
+    match kind {
+        TYPE_DATA => Ok(Message::Data {
+            key,
+            payload: buffer,
+        }),
+        TYPE_ACK if buffer.is_empty() => Ok(Message::Ack { key }),
+        TYPE_ACK => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ACK must have no payload",
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Unknown message type",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +136,17 @@ mod tests {
     }
 
     #[test]
+    fn test_ack_roundtrip() {
+        let key = b"gradient";
+        assert_eq!(
+            decode(encode_ack(key)).unwrap(),
+            Message::Ack {
+                key: Bytes::from_static(b"gradient"),
+            }
+        );
+    }
+
+    #[test]
     fn test_empty_payload() {
         let encoded = encode_state(b"x", b"", b"").unwrap();
         assert_eq!(encoded.len(), HEADER_SIZE + 1 + 4);
@@ -132,6 +165,7 @@ mod tests {
         let original_key_ptr = encoded[HEADER_SIZE..].as_ptr();
         match decode(encoded).unwrap() {
             Message::Data { key, .. } => assert_ne!(key.as_ptr(), original_key_ptr),
+            _ => panic!("expected DATA"),
         }
     }
 
@@ -141,15 +175,19 @@ mod tests {
         assert!(encode_state(b"", b"", b"").is_err());
         assert!(encode_state(&vec![0; MAX_KEY_SIZE + 1], b"", b"").is_err());
 
-        let mut unknown = encode_state(b"x", b"", b"").unwrap().to_vec();
-        unknown[0] = 1; // The previous ACK type is invalid in this experiment.
+        let mut extra = encode_ack(b"x").to_vec();
+        extra.push(0);
+        assert!(decode(Bytes::from(extra)).is_err());
+
+        let mut unknown = encode_ack(b"x").to_vec();
+        unknown[0] = 255;
         assert!(decode(Bytes::from(unknown)).is_err());
 
-        let mut truncated = encode_state(b"x", b"", b"").unwrap().to_vec();
+        let mut truncated = encode_ack(b"x").to_vec();
         truncated[2] = 20;
         assert!(decode(Bytes::from(truncated)).is_err());
 
-        let mut zero_key = encode_state(b"x", b"", b"").unwrap().to_vec();
+        let mut zero_key = encode_ack(b"x").to_vec();
         zero_key[2] = 0;
         assert!(decode(Bytes::from(zero_key)).is_err());
     }
