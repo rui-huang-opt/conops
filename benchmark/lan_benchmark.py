@@ -1,4 +1,5 @@
-"""Benchmark communication on a persistent six-node LAN topology.
+"""
+Benchmark communication on a persistent six-node LAN topology.
 
 Run this script once on each of the six nodes, with a different --node_id
 and identical benchmark options. Each backend connects just once. Repeats

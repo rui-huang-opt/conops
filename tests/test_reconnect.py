@@ -10,7 +10,6 @@ Run: python -m pytest -v tests/test_reconnect.py
 
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
-from typing import Protocol
 import socket
 import struct
 import threading
@@ -20,11 +19,6 @@ import msgspec
 import numpy as np
 
 from conops import Network
-
-
-class BarrierLike(Protocol):
-    def wait(self, timeout: float | None = None) -> int: ...
-
 
 N_EXCHANGES = 7
 CUT_EXCHANGE = 3
@@ -188,11 +182,7 @@ class FaultProxy:
             self._close_pair(pair)
 
 
-def worker(
-    node_id: str,
-    endpoints: dict[str, str],
-    barrier: BarrierLike,
-) -> tuple[str, list[float]]:
+def worker(node_id: str, endpoints: dict[str, str]) -> tuple[str, list[float]]:
     peer_id = "2" if node_id == "1" else "1"
     network = Network(
         node_id=node_id,
@@ -215,7 +205,6 @@ def worker(
             expected = np.array([int(peer_id), k], dtype=np.int64)
             np.testing.assert_array_equal(received[peer_id], expected)
 
-        barrier.wait(timeout=30)
         return node_id, elapsed
     finally:
         network.close()
@@ -233,18 +222,12 @@ def test_reconnect() -> None:
         endpoints2 = {"1": addr1, "2": addr2}
 
         ctx = get_context("spawn")
-        with ctx.Manager() as manager:
-            barrier = manager.Barrier(2)
-
-            with ProcessPoolExecutor(
-                max_workers=2,
-                mp_context=ctx,
-            ) as executor:
-                futures = [
-                    executor.submit(worker, "1", endpoints1, barrier),
-                    executor.submit(worker, "2", endpoints2, barrier),
-                ]
-                results = [future.result(timeout=90) for future in futures]
+        with ProcessPoolExecutor(max_workers=2, mp_context=ctx) as executor:
+            futures = [
+                executor.submit(worker, "1", endpoints1),
+                executor.submit(worker, "2", endpoints2),
+            ]
+            results = [future.result(timeout=90) for future in futures]
 
         print("\nExchange latencies (seconds):")
         for node_id, times in results:

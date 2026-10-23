@@ -9,22 +9,16 @@ import socket
 import time
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
-from typing import Protocol
 
 import numpy as np
 
 from conops import Network
 
-
-class BarrierLike(Protocol):
-    def wait(self, timeout: float | None = None) -> int: ...
-
-
 KEYS = [(20, "x"), (2, "gradient"), "last", 7]
 NEIGHBORS = {"1": {"2": 0.5}, "2": {"1": 0.5, "3": 0.5}, "3": {"2": 0.5}}
 
 
-def run_node(node_id: str, endpoints: dict[str, str], barrier: BarrierLike) -> bool:
+def run_node(node_id: str, endpoints: dict[str, str]) -> bool:
     neighbors = NEIGHBORS[node_id]
     local_endpoints = {peer: endpoints[peer] for peer in (node_id, *neighbors)}
     network = Network(
@@ -57,7 +51,6 @@ def run_node(node_id: str, endpoints: dict[str, str], barrier: BarrierLike) -> b
         else:
             raise AssertionError("A completed exchange key was reused")
 
-        barrier.wait(timeout=30)
         return True
     finally:
         network.close()
@@ -82,18 +75,9 @@ def test_semantic_keys() -> None:
     }
 
     ctx = get_context("spawn")
-    with ctx.Manager() as manager:
-        barrier = manager.Barrier(len(NEIGHBORS))
-
-        with ProcessPoolExecutor(
-            max_workers=len(NEIGHBORS),
-            mp_context=ctx,
-        ) as executor:
-            tasks = [
-                executor.submit(run_node, node_id, endpoints, barrier)
-                for node_id in NEIGHBORS
-            ]
-            assert all(task.result(timeout=60) for task in tasks)
+    with ProcessPoolExecutor(max_workers=len(NEIGHBORS), mp_context=ctx) as executor:
+        tasks = [executor.submit(run_node, node_id, endpoints) for node_id in NEIGHBORS]
+        assert all(task.result(timeout=60) for task in tasks)
 
 
 if __name__ == "__main__":

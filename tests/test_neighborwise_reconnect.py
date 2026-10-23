@@ -14,17 +14,11 @@ from multiprocessing import get_context
 import socket
 import struct
 import threading
-from typing import Protocol
 
 import msgspec
 import numpy as np
 
 from conops import Network
-
-
-class BarrierLike(Protocol):
-    def wait(self, timeout: float | None = None) -> int: ...
-
 
 NODE_IDS = ("1", "2", "3")
 NEIGHBORS = {"1": ("2",), "2": ("1", "3"), "3": ("2",)}
@@ -190,7 +184,7 @@ def make_data(sender: str, destination: str, step: int) -> np.ndarray:
     return np.array([int(sender), int(destination), step], dtype=np.int64)
 
 
-def worker(node_id: str, endpoints: dict[str, str], barrier: BarrierLike) -> str:
+def worker(node_id: str, endpoints: dict[str, str]) -> str:
     neighbors = {peer: 0.5 for peer in NEIGHBORS[node_id]}
     # Static endpoints must cover only self + this node's actual neighbors.
     local_endpoints = {peer: endpoints[peer] for peer in (node_id, *neighbors)}
@@ -208,8 +202,6 @@ def worker(node_id: str, endpoints: dict[str, str], barrier: BarrierLike) -> str
             for peer, actual in received.items():
                 np.testing.assert_array_equal(actual, make_data(peer, node_id, step))
 
-        # Avoid last-round connection shutdown racing another node's receive.
-        barrier.wait(timeout=30)
         return node_id
     finally:
         network.close()
@@ -226,19 +218,16 @@ def test_neighborwise_reconnect() -> None:
         node2_endpoints["3"] = f"tcp://127.0.0.1:{proxy.port}"
 
         ctx = get_context("spawn")
-        with ctx.Manager() as manager:
-            barrier = manager.Barrier(len(NODE_IDS))
-            with ProcessPoolExecutor(max_workers=len(NODE_IDS), mp_context=ctx) as pool:
-                futures = [
-                    pool.submit(
-                        worker,
-                        node,
-                        node2_endpoints if node == "2" else endpoints,
-                        barrier,
-                    )
-                    for node in NODE_IDS
-                ]
-                results = [future.result(timeout=90) for future in futures]
+        with ProcessPoolExecutor(max_workers=len(NODE_IDS), mp_context=ctx) as pool:
+            futures = [
+                pool.submit(
+                    worker,
+                    node,
+                    node2_endpoints if node == "2" else endpoints,
+                )
+                for node in NODE_IDS
+            ]
+            results = [future.result(timeout=90) for future in futures]
 
         assert set(results) == set(NODE_IDS)
         assert proxy.did_cut, "The proxy did not drop DATA in both directions"
