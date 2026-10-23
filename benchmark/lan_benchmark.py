@@ -3,6 +3,7 @@ import time
 from statistics import median
 from typing import cast
 
+import numpy as np
 import numpy.random as npr
 
 from conops import Graph, LiteNetwork, Network
@@ -55,9 +56,9 @@ def benchmark(
 
         for k in range(n_warmup):
             if kind == "Rust":
-                network.exchange(x, key=f"warmup-{k}")
+                network.exchange(np.zeros(1), key=f"warmup-{k}")
             else:
-                network.exchange(x, key=f"warmup-{k}")
+                network.exchange(np.zeros(1), key=f"warmup-{k}")
 
         start = time.perf_counter()
 
