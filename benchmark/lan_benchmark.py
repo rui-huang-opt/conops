@@ -21,15 +21,7 @@ EDGES = [
 ]
 
 
-def benchmark(
-    kind,
-    node_id,
-    neighbors,
-    group_id,
-    n_state,
-    n_iter,
-    n_warmup,
-):
+def benchmark(kind, node_id, neighbors, group_id, n_state, n_iter, n_warmup):
     if kind == "Rust":
         network = Network(
             node_id=node_id,
@@ -59,12 +51,8 @@ def benchmark(
         start = time.perf_counter()
 
         for k in range(n_iter - 1):
-            if kind == "Rust":
-                x = x - 0.45 * network.laplacian(x, key=(k, "x"))
-                y = y - 0.20 * network.laplacian(y, key=(k, "y"))
-            else:
-                x = x - 0.45 * network.laplacian(x, key=(k, "x"))
-                y = y - 0.20 * network.laplacian(y, key=(k, "y"))
+            x = x - 0.45 * network.laplacian(x, key=(k, "x"))
+            y = y - 0.20 * network.laplacian(y, key=(k, "y"))
 
         return time.perf_counter() - start
 
