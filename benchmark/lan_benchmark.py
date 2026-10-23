@@ -5,7 +5,6 @@ Rust and Lite connect once and reuse their connections across repeats.
 The --copy / --no-copy option applies only to Rust.
 """
 
-import os
 import argparse
 import time
 from statistics import median
@@ -46,7 +45,7 @@ def measure_rust(
 
     before = time.perf_counter()
     for k in range(n_iter - 1):
-        x = x - 0.45 * network.laplacian(x, key=(k, f"{repeat}-x"), copy=copy)
+        x = x - 0.25 * network.laplacian(x, key=(k, f"{repeat}-x"), copy=copy)
         y = y - 0.20 * network.laplacian(y, key=(k, f"{repeat}-y"), copy=copy)
     return time.perf_counter() - before
 
@@ -68,7 +67,7 @@ def measure_lite(
 
     before = time.perf_counter()
     for k in range(n_iter - 1):
-        x = x - 0.45 * network.laplacian(x, key=(k, f"{repeat}-x"))
+        x = x - 0.25 * network.laplacian(x, key=(k, f"{repeat}-x"))
         y = y - 0.20 * network.laplacian(y, key=(k, f"{repeat}-y"))
     return time.perf_counter() - before
 
