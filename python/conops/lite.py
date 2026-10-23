@@ -69,12 +69,12 @@ class LiteNetwork:
         self._node_id = node_id
         self._group_id = group_id
         self._transform = transform if transform is not None else Identity()
+        self._close_wait = close_wait
 
         self._context = zmq.Context()
 
         self._neighbors = neighbors.copy()
         self._weight = 1.0 - sum(neighbors.values())
-        self._close_wait = close_wait
 
         self._neighbor_id_bytes = [j.encode("utf-8") for j in self._neighbors]
 
@@ -146,7 +146,9 @@ class LiteNetwork:
         Bootstrap the network using Pyre for discovery, then establish
         direct ZeroMQ connections to all neighbors.
         """
-        pyre_node = pyre.Pyre(self._node_id, ctx=self._context)
+        # Pyre uses its own context, separate from the data context.
+        pyre_node = pyre.Pyre(self._node_id)
+        success = False
 
         try:
             pyre_node.set_header("port", str(port))
@@ -155,16 +157,18 @@ class LiteNetwork:
 
             endpoints = self._discover_neighbors(pyre_node)
             self._connect_to_neighbors(endpoints)
-
-        except Exception:
-            self.close()
-            raise
+            success = True
 
         finally:
             try:
                 pyre_node.stop()
             except Exception:
                 logger.exception("[%s] Failed to stop Pyre node.", self._node_id)
+            finally:
+                pyre_node.inbox.close(linger=0)
+
+            if not success:
+                self.close()
 
     def _create_sockets(self) -> int:
         self._out_socket = self._context.socket(zmq.ROUTER)
