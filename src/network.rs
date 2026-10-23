@@ -164,6 +164,10 @@ enum Command {
     CancelExchange {
         key: Bytes,
     },
+    Drain {
+        deadline: Instant,
+        reply: Reply,
+    },
 }
 
 // Broadcast shares one DATA buffer; neighborwise keeps one DATA buffer per peer.
@@ -282,12 +286,19 @@ enum PeerEvent {
         session: u64,
         reason: String,
     },
+    DrainFlushed {
+        peer: PeerIndex,
+        session: u64,
+        id: u64,
+    },
 }
 
 // DATA retains shared Bytes; ACKs carry only their validated key until writing.
 enum Outbound {
     Data(Bytes),
     Ack(Bytes),
+    // Local queue marker: never sent over TCP.
+    DrainFlush(u64),
 }
 
 #[derive(Default)]
@@ -328,7 +339,9 @@ impl AckBacklog {
                             self.deferred.push_front(key);
                             return Ok(()); // backpressure, NOT a broken TCP connection
                         }
-                        Err(async_mpsc::error::TrySendError::Full(Outbound::Data(_))) => {
+                        Err(async_mpsc::error::TrySendError::Full(
+                            Outbound::Data(_) | Outbound::DrainFlush(_),
+                        )) => {
                             unreachable!("only ACKs are retried here");
                         }
                     }
@@ -417,6 +430,15 @@ impl PeerConnections {
 struct PendingExchange {
     batch: Batch,
     reply: ExchangeReply,
+}
+
+/// Graceful shutdown only: normal exchange latency and completion are unchanged.
+struct DrainRequest {
+    id: u64,
+    deadline: Instant,
+    reply: Reply,
+    // None: wait for outbound DATA ACKs; Some: await per-writer markers.
+    waiting: Option<HashMap<PeerIndex, u64>>,
 }
 
 /// Messages not yet ACKed by this neighbor. Preserve the send order on replay.
@@ -547,6 +569,17 @@ async fn write_peer(
                 Ok(data) => send_message(&mut writer, data, max_message_size).await,
                 Err(err) => Err(err),
             },
+            Outbound::DrainFlush(id) => {
+                // All frames before this marker have completed write_all().
+                if events
+                    .send(PeerEvent::DrainFlushed { peer, session, id })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                Ok(())
+            }
         };
         if let Err(err) = result {
             let _ = events
@@ -659,6 +692,73 @@ fn complete_exchange(
     }
 }
 
+/// Nonblocking progress: it must never wait on an mpsc queue from the network loop.
+fn progress_drain(
+    drain: &mut DrainRequest,
+    peers: &PeerConnections,
+    unacked: &HashMap<PeerIndex, UnackedMessages>,
+    capacity_changed: &Notify,
+) -> Result<bool, String> {
+    if let Some(waiting) = drain.waiting.as_ref() {
+        // A writer from another TCP session cannot satisfy an old marker.
+        for (&index, &session) in waiting {
+            if !peers.live.get(&index).is_some_and(|p| p.session == session) {
+                return Err(format!(
+                    "Peer {} disconnected during drain",
+                    peers.ids[index]
+                ));
+            }
+        }
+        return Ok(waiting.is_empty());
+    }
+
+    // An ACK proves the peer has accepted our DATA. Still keep readers alive
+    // so that receiving and acknowledging the peer's DATA can proceed.
+    if unacked.values().any(|pending| !pending.frames.is_empty())
+        || peers
+            .live
+            .values()
+            .any(|peer| !peer.acknowledgments.deferred.is_empty())
+    {
+        return Ok(false);
+    }
+
+    // Insert one marker behind every queued ACK. Reserve all permits before
+    // inserting any markers, so queue pressure cannot create a partial phase.
+    let mut permits = Vec::with_capacity(peers.live.len());
+    for (&index, peer) in &peers.live {
+        match peer.sender.try_reserve() {
+            Ok(permit) => permits.push((index, peer.session, permit)),
+            Err(async_mpsc::error::TrySendError::Closed(_)) => {
+                return Err(format!(
+                    "Peer {} writer stopped during drain",
+                    peers.ids[index]
+                ));
+            }
+            Err(async_mpsc::error::TrySendError::Full(_)) => {
+                // The writer will wake the network loop on available capacity.
+                // Retry once after registering to avoid a lost wakeup.
+                peer.acknowledgments
+                    .capacity_waiting
+                    .store(true, Ordering::Release);
+                if let Ok(permit) = peer.sender.try_reserve() {
+                    drop(permit);
+                    capacity_changed.notify_one();
+                }
+                return Ok(false);
+            }
+        }
+    }
+    let mut waiting = HashMap::with_capacity(permits.len());
+    for (index, session, permit) in permits {
+        waiting.insert(index, session);
+        permit.send(Outbound::DrainFlush(drain.id));
+    }
+    let finished = waiting.is_empty();
+    drain.waiting = Some(waiting);
+    Ok(finished)
+}
+
 fn disconnect_peer(node_id: &str, peers: &mut PeerConnections, index: PeerIndex, reason: &str) {
     if let Some(peer) = peers.live.remove(&index) {
         peer.reader.abort();
@@ -682,6 +782,7 @@ fn handle_peer_event(
     pending: &mut Option<PendingExchange>,
     completed: &mut CompletedKeys,
     recycled_slots: &mut Vec<Option<Bytes>>,
+    draining: &mut Option<DrainRequest>,
 ) {
     match event {
         PeerEvent::Ack { peer, session, key } => {
@@ -747,6 +848,17 @@ fn handle_peer_event(
         } => {
             if peers.live.get(&peer).is_some_and(|p| p.session == session) {
                 disconnect_peer(node_id, peers, peer, &reason);
+            }
+        }
+        PeerEvent::DrainFlushed { peer, session, id } => {
+            if let Some(drain) = draining.as_mut() {
+                if drain.id == id {
+                    if let Some(waiting) = drain.waiting.as_mut() {
+                        if waiting.get(&peer) == Some(&session) {
+                            waiting.remove(&peer);
+                        }
+                    }
+                }
             }
         }
     }
@@ -819,6 +931,10 @@ async fn run_network(
     retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut pending: Option<PendingExchange> = None;
+    let mut draining: Option<DrainRequest> = None;
+    let mut quiescing = false;
+    let mut drained = false;
+    let mut next_drain_id = 0u64;
     let mut early = EarlyMessages::new(EARLY_MAX_MESSAGES, config.max_early_bytes);
     let mut completed = CompletedKeys::new(COMPLETED_MAX_KEYS);
     // Retain unacknowledged DATA separately for each peer, even while disconnected.
@@ -826,8 +942,23 @@ async fn run_network(
     early.reserve_peers(peers.ids.len());
 
     loop {
+        // Copy the deadline to avoid borrowing `draining` across select branches.
+        let drain_deadline = draining.as_ref().map(|request| request.deadline);
         tokio::select! {
             _ = &mut stop_rx => break,
+
+            _ = async {
+                match drain_deadline {
+                    Some(deadline) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                    }
+                    None => future::pending::<()>().await,
+                }
+            } => {
+                if let Some(request) = draining.take() {
+                    let _ = request.reply.send(Err("Drain timed out".into()));
+                }
+            },
 
             accepted = listener.accept() => {
                 match accepted {
@@ -856,6 +987,10 @@ async fn run_network(
             command = command_rx.recv() => {
                 match command {
                     Some(Command::Connect { peer_id, address, reply }) => {
+                        if quiescing {
+                            let _ = reply.send(Err("Network is draining".into()));
+                            continue;
+                        }
                         if neighbors.as_ref().is_some_and(|ids| !ids.contains(&peer_id)) {
                             let _ = reply.send(Err(format!("Peer {peer_id} is not a configured neighbor")));
                         } else if peers.contains_id(&peer_id) || !connecting.insert(peer_id.clone()) {
@@ -871,6 +1006,10 @@ async fn run_network(
                         let _ = reply.send(ids);
                     }
                     Some(Command::Exchange { key, data, reply }) => {
+                        if quiescing {
+                            let _ = reply.send(Err("Network is draining".into()));
+                            continue;
+                        }
                         if pending.is_some() {
                             let _ = reply.send(Err("Another exchange is in progress".into()));
                             continue;
@@ -941,6 +1080,26 @@ async fn run_network(
                         if pending.as_ref().is_some_and(|p| p.batch.key() == &key) {
                             fail_exchange(&mut pending, &mut completed, &mut recycled_slots,
                                 "Exchange cancelled after timeout".into());
+                        }
+                    }
+                    Some(Command::Drain { deadline, reply }) => {
+                        if drained {
+                            let _ = reply.send(Ok(()));
+                        } else if draining.is_some() {
+                            let _ = reply.send(Err("Another drain is already in progress".into()));
+                        } else if pending.is_some() {
+                            let _ = reply.send(Err("Cannot drain while an exchange is in progress".into()));
+                        } else {
+                            // Terminal operation: subsequent exchanges are not accepted,
+                            // including if this drain later times out.
+                            quiescing = true;
+                            next_drain_id = next_drain_id.wrapping_add(1);
+                            draining = Some(DrainRequest {
+                                id: next_drain_id,
+                                deadline,
+                                reply,
+                                waiting: None,
+                            });
                         }
                     }
                     None => break,
@@ -1057,16 +1216,46 @@ async fn run_network(
             event = event_rx.recv() => {
                 let Some(event) = event else { break; };
                 handle_peer_event(event, &node_id, &mut peers, &mut unacked,
-                    &mut early, &mut pending, &mut completed, &mut recycled_slots);
+                    &mut early, &mut pending, &mut completed, &mut recycled_slots, &mut draining);
                 for _ in 1..EVENT_BATCH_LIMIT {
                     let Ok(event) = event_rx.try_recv() else { break; };
                     handle_peer_event(event, &node_id, &mut peers, &mut unacked,
-                        &mut early, &mut pending, &mut completed, &mut recycled_slots);
+                        &mut early, &mut pending, &mut completed, &mut recycled_slots, &mut draining);
                 }
+            }
+        }
+
+        if draining
+            .as_ref()
+            .is_some_and(|request| Instant::now() >= request.deadline)
+        {
+            if let Some(request) = draining.take() {
+                let _ = request.reply.send(Err("Drain timed out".into()));
+            }
+        } else {
+            let progress = draining
+                .as_mut()
+                .map(|request| progress_drain(request, &peers, &unacked, &capacity_changed));
+            match progress {
+                Some(Ok(true)) => {
+                    drained = true;
+                    let request = draining.take().expect("completed drain");
+                    let _ = request.reply.send(Ok(()));
+                }
+                Some(Err(reason)) => {
+                    let request = draining.take().expect("failed drain");
+                    let _ = request.reply.send(Err(reason));
+                }
+                _ => {}
             }
         }
     }
 
+    if let Some(request) = draining.take() {
+        let _ = request
+            .reply
+            .send(Err("Network stopped during drain".into()));
+    }
     fail_exchange(
         &mut pending,
         &mut completed,
@@ -1508,6 +1697,47 @@ impl CoreNetwork {
             ExchangeData::Neighborwise(frames),
             timeout,
         )
+    }
+
+    /// Wait for outbound DATA acknowledgments and locally queued ACK writes.
+    /// This is a terminal operation; call close() afterwards even on timeout.
+    #[pyo3(signature = (timeout=5.0))]
+    pub fn drain(&self, py: Python<'_>, timeout: f64) -> PyResult<()> {
+        if !timeout.is_finite() || timeout < 0.0 {
+            return Err(PyValueError::new_err("timeout must be finite and >= 0"));
+        }
+        let duration = Duration::try_from_secs_f64(timeout)
+            .map_err(|_| PyValueError::new_err("timeout is too large"))?;
+        let deadline = Instant::now()
+            .checked_add(duration)
+            .ok_or_else(|| PyValueError::new_err("timeout is too large"))?;
+        let commands = self
+            .commands
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Node is not started"))?;
+        let (reply, mut result_rx) = mpsc::channel();
+        commands
+            .send(Command::Drain { deadline, reply })
+            .map_err(|_| PyRuntimeError::new_err("Network worker has stopped"))?;
+
+        loop {
+            py.check_signals()?;
+            let rx = &mut result_rx;
+            let result = py.detach(move || rx.recv_timeout(Duration::from_millis(100)));
+            match result {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(reason)) if reason == "Drain timed out" => {
+                    return Err(PyTimeoutError::new_err(reason));
+                }
+                Ok(Err(reason)) => return Err(PyRuntimeError::new_err(reason)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(PyRuntimeError::new_err(
+                        "Network worker stopped during drain",
+                    ));
+                }
+            }
+        }
     }
 
     pub fn close(&mut self, py: Python<'_>) -> PyResult<()> {

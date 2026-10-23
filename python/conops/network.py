@@ -165,8 +165,12 @@ class Network:
         """Return currently connected peer IDs."""
         return self._core.peers()
 
-    def close(self) -> None:
-        self._core.close()
+    def close(self, timeout: float = 5.0) -> None:
+        try:
+            if timeout != 0:
+                self._core.drain(timeout=timeout)
+        finally:
+            self._core.close()
 
     def _resolve_peer_endpoints(
         self,
