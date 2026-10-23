@@ -7,13 +7,17 @@ import numpy.random as npr
 
 from conops import Graph, LiteNetwork, Network
 
-NODES = ["1", "2", "3", "4", "5"]
+NODES = ["1", "2", "3", "4", "5", "6"]
 EDGES = [
     ("1", "2"),
     ("2", "3"),
     ("3", "4"),
     ("4", "5"),
-    ("5", "1"),
+    ("5", "6"),
+    ("6", "1"),
+    ("1", "4"),
+    ("2", "5"),
+    ("3", "6"),
 ]
 
 
