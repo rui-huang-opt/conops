@@ -69,6 +69,68 @@ where
     Ok(())
 }
 
+/// Send one unchanged wire frame from an owned head and a separate payload.
+/// Used only by the opt-in neighborwise borrowing path. max_size counts the
+/// complete body (head + payload), just as it does for send_message().
+///
+/// Both slices must remain valid and immutable until this future finishes.
+/// The caller must keep their owners alive across every partial write / await.
+/// Like send_message(), cancelling mid-frame requires closing that connection.
+pub async fn send_message_parts<W>(
+    writer: &mut W,
+    head: &[u8],
+    payload: &[u8],
+    max_size: usize,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let size = head
+        .len()
+        .checked_add(payload.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Message too large"))?;
+    if size > max_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Message too large",
+        ));
+    }
+    let len = u32::try_from(size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Message length exceeds u32"))?;
+    let prefix = len.to_be_bytes();
+    let slices = [
+        IoSlice::new(&prefix),
+        IoSlice::new(head),
+        IoSlice::new(payload),
+    ];
+    let written = loop {
+        match writer.write_vectored(&slices).await {
+            Ok(n) => break n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    };
+    if written == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "Failed to write TCP frame",
+        ));
+    }
+
+    // Map the initial partial write onto all three slices. This also works
+    // when AsyncWrite uses its non-vectored fallback and consumes only prefix.
+    let mut consumed = written;
+    for part in [&prefix[..], head, payload] {
+        if consumed >= part.len() {
+            consumed -= part.len();
+        } else {
+            writer.write_all(&part[consumed..]).await?;
+            consumed = 0;
+        }
+    }
+    Ok(())
+}
+
 pub async fn recv_message<R>(reader: &mut R, max_size: usize) -> io::Result<Bytes>
 where
     R: AsyncRead + Unpin,
@@ -298,5 +360,144 @@ mod tests {
         assert_eq!(&writer.output[4..], payload.as_slice());
         assert_eq!(writer.vectored_calls, 1);
         assert_eq!(writer.scalar_calls, 0);
+    }
+    #[tokio::test]
+    async fn split_frame_handles_every_partial_write_boundary() {
+        for (head, payload) in [
+            (b"head".as_slice(), b"payload".as_slice()),
+            (b"".as_slice(), b"payload".as_slice()),
+            (b"head".as_slice(), b"".as_slice()),
+            (b"".as_slice(), b"".as_slice()),
+        ] {
+            let size = head.len() + payload.len();
+            let mut expected = (size as u32).to_be_bytes().to_vec();
+            expected.extend_from_slice(head);
+            expected.extend_from_slice(payload);
+            for limit in 1..=expected.len() + 1 {
+                let mut writer = LimitedWriter::new(limit);
+                send_message_parts(&mut writer, head, payload, size)
+                    .await
+                    .unwrap();
+                assert_eq!(writer.output, expected, "write limit: {limit}");
+                assert_eq!(writer.vectored_calls, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn split_frame_checks_total_size_before_any_write() {
+        let mut writer = LimitedWriter::new(usize::MAX);
+        let error = send_message_parts(&mut writer, b"123", b"4567", 6)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(writer.output.is_empty());
+        assert_eq!(writer.vectored_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn split_frame_zero_write_is_an_error() {
+        let mut writer = LimitedWriter::new(0);
+        let error = send_message_parts(&mut writer, b"h", b"data", 16)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+    }
+
+    #[tokio::test]
+    async fn split_large_frame_preserves_following_frames() {
+        let (mut tx, rx) = tokio::io::duplex(127);
+        let head = b"metadata";
+        let payload = vec![0x5b; 256 * 1024];
+        let send_payload = payload.clone();
+        let writer = tokio::spawn(async move {
+            send_message_parts(&mut tx, head, &send_payload, 512 * 1024)
+                .await
+                .unwrap();
+            send_message(&mut tx, b"next", 16).await.unwrap();
+        });
+        let mut reader = FrameReader::new(rx);
+        let frame = reader.recv(512 * 1024).await.unwrap();
+        assert_eq!(&frame[..head.len()], head);
+        assert_eq!(&frame[head.len()..], payload.as_slice());
+        assert_eq!(reader.recv(16).await.unwrap().as_ref(), b"next");
+        writer.await.unwrap();
+    }
+
+    /// Inject Interrupted once, then delegate to an ordinary partial writer.
+    struct InterruptedWriter {
+        inner: LimitedWriter,
+        interrupted: bool,
+    }
+
+    impl AsyncWrite for InterruptedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, data)
+        }
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::Interrupted)));
+            }
+            Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+        }
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn split_frame_retries_interrupted_initial_write() {
+        let mut writer = InterruptedWriter {
+            inner: LimitedWriter::new(3),
+            interrupted: false,
+        };
+        send_message_parts(&mut writer, b"abc", b"de", 5)
+            .await
+            .unwrap();
+        assert_eq!(writer.inner.output, b"\x00\x00\x00\x05abcde");
+    }
+
+    struct ScalarWriter(LimitedWriter);
+
+    impl AsyncWrite for ScalarWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, data)
+        }
+        // Intentionally keep AsyncWrite's default poll_write_vectored fallback.
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn split_frame_works_with_non_vectored_writer() {
+        let mut writer = ScalarWriter(LimitedWriter::new(2));
+        send_message_parts(&mut writer, b"head", b"body", 8)
+            .await
+            .unwrap();
+        assert_eq!(writer.0.output, b"\x00\x00\x00\x08headbody");
+        assert_eq!(writer.0.vectored_calls, 0);
     }
 }

@@ -30,7 +30,7 @@ use tokio::{
 use crate::discovery::{Discovery, DiscoveryEvent};
 use crate::exchange::{Batch, CompletedKeys, EarlyMessages, PeerIndex, PeerLayout};
 use crate::message;
-use crate::tcp::{FrameReader, recv_message, send_message};
+use crate::tcp::{FrameReader, recv_message, send_message, send_message_parts};
 
 const HELLO_MAX_SIZE: usize = 1024;
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
@@ -47,7 +47,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-// Per-neighbor unacknowledged DATA is bounded (shared Bytes, no payload copy).
+// Per-neighbor unacknowledged DATA is bounded (shared frames, no replay copy).
 const MAX_UNACKED_MESSAGES: usize = 4;
 const DEFAULT_MAX_UNACKED_BYTES: usize = 128 * 1024 * 1024;
 
@@ -170,14 +170,95 @@ enum Command {
     },
 }
 
-// Broadcast shares one DATA buffer; neighborwise keeps one DATA buffer per peer.
+// Owned frames keep the existing copy=True / broadcast representation.
+// Borrowed frames keep their actual Python exporter alive through a private
+// memoryview. Clones share one owner through Arc, including during replay.
+#[derive(Clone)]
+enum DataFrame {
+    Owned(Bytes),
+    Borrowed(Arc<BorrowedFrame>),
+}
+
+impl DataFrame {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(frame) => frame.len(),
+            // Construction checked this sum against max_message_size / u32.
+            Self::Borrowed(frame) => frame.head.len() + frame.payload_len,
+        }
+    }
+}
+
+impl From<Bytes> for DataFrame {
+    fn from(frame: Bytes) -> Self {
+        Self::Owned(frame)
+    }
+}
+
+/// A small owned protocol head plus an exported, immutable-by-contract payload.
+///
+/// The private memoryview owns a buffer export of the *prepared* NumPy uint8
+/// array, not merely the user's original state. It keeps temporary contiguous
+/// arrays and their base owners alive. It is never exposed to Python callers,
+/// so callers cannot release this memoryview while a writer still uses it.
+///
+/// This is an opt-in borrowing contract, NOT a lock: copy=False callers must
+/// not mutate, resize, or invalidate the exported storage (including through
+/// aliases / reused Transform buffers), even after exchange return or timeout.
+/// In this first API there is no send-completion handle: use fresh arrays for
+/// subsequent updates, or keep copy=True when reusing writable storage.
+struct BorrowedFrame {
+    head: Bytes,
+    _owner: Py<PyMemoryView>,
+    payload_ptr: *const u8,
+    payload_len: usize,
+}
+
+// SAFETY: new() requires the exporter to remain immutable and at a stable
+// address until the last Arc is dropped. _owner keeps the export alive, and
+// worker threads only read its bytes; they never call Python APIs through it.
+// Py<T> handles deferred decref when dropped on a detached worker thread.
+// Python references alone do NOT provide immutability: this relies on the
+// explicitly documented copy=False caller contract (as non-copy I/O does).
+unsafe impl Send for BorrowedFrame {}
+// SAFETY: the same ownership / immutability invariant permits concurrent reads.
+unsafe impl Sync for BorrowedFrame {}
+
+impl BorrowedFrame {
+    /// # Safety
+    /// `payload` must be the contiguous byte storage exported by `object`.
+    /// Its contents and address must not change, even via an alias, until all
+    /// queue, writer, and unacknowledged/replay references have been released.
+    unsafe fn new(head: Bytes, object: &Bound<'_, PyAny>, payload: &[u8]) -> PyResult<Self> {
+        let owner = PyMemoryView::from(object)?.unbind();
+        Ok(Self {
+            head,
+            _owner: owner,
+            payload_ptr: payload.as_ptr(),
+            payload_len: payload.len(),
+        })
+    }
+
+    fn payload(&self) -> &[u8] {
+        if self.payload_len == 0 {
+            return &[];
+        }
+        // SAFETY: new() established the buffer/export invariants above. The
+        // returned slice is tied to &self; the writer holds its Arc across the
+        // entire async send, including partial writes and backpressure waits.
+        unsafe { std::slice::from_raw_parts(self.payload_ptr, self.payload_len) }
+    }
+}
+
+// Both broadcast and neighborwise can borrow their prepared payloads;
+// the same frame representation and wire protocol are used for both.
 enum ExchangeData {
-    Broadcast(Bytes),
-    Neighborwise(HashMap<String, Bytes>),
+    Broadcast(DataFrame),
+    Neighborwise(HashMap<String, DataFrame>),
 }
 
 impl ExchangeData {
-    fn for_peer(&self, peer_id: &str) -> Option<&Bytes> {
+    fn for_peer(&self, peer_id: &str) -> Option<&DataFrame> {
         match self {
             Self::Broadcast(frame) => Some(frame),
             Self::Neighborwise(frames) => frames.get(peer_id),
@@ -293,9 +374,9 @@ enum PeerEvent {
     },
 }
 
-// DATA retains shared Bytes; ACKs carry only their validated key until writing.
+// DATA retains an owned snapshot or a borrowed exporter; ACKs are unchanged.
 enum Outbound {
-    Data(Bytes),
+    Data(DataFrame),
     Ack(Bytes),
     // Local queue marker: never sent over TCP.
     DrainFlush(u64),
@@ -445,7 +526,7 @@ struct DrainRequest {
 /// Only a few frames are retained; a VecDeque keeps this simpler than two maps.
 #[derive(Default)]
 struct UnackedMessages {
-    frames: VecDeque<(Bytes, Bytes)>,
+    frames: VecDeque<(Bytes, DataFrame)>,
     bytes: usize,
 }
 
@@ -468,7 +549,8 @@ impl UnackedMessages {
     }
 
     // Caller must have passed check_capacity() on the same event-loop iteration.
-    fn insert(&mut self, key: Bytes, frame: Bytes) {
+    fn insert(&mut self, key: Bytes, frame: impl Into<DataFrame>) {
+        let frame = frame.into();
         self.bytes += frame.len();
         self.frames.push_back((key, frame));
     }
@@ -555,7 +637,7 @@ async fn write_peer(
     capacity_waiting: Arc<AtomicBool>,
     capacity_changed: Arc<Notify>,
 ) {
-    // Small ACK storage is reused. DATA still takes the original send path.
+    // Small ACK storage is reused; owned DATA keeps its original send path.
     let mut ack_buffer = [0u8; message::ACK_BUFFER_SIZE];
     while let Some(frame) = outbound.recv().await {
         if capacity_waiting.load(Ordering::Acquire)
@@ -564,7 +646,15 @@ async fn write_peer(
             capacity_changed.notify_one();
         }
         let result = match frame {
-            Outbound::Data(data) => send_message(&mut writer, &data, max_message_size).await,
+            Outbound::Data(DataFrame::Owned(data)) => {
+                send_message(&mut writer, &data, max_message_size).await
+            }
+            Outbound::Data(DataFrame::Borrowed(frame)) => {
+                // The writer holds its Arc during the entire asynchronous write;
+                // ACK can only drop the cache's independent reference.
+                send_message_parts(&mut writer, &frame.head, frame.payload(), max_message_size)
+                    .await
+            }
             Outbound::Ack(key) => match message::encode_ack_into(&key, &mut ack_buffer) {
                 Ok(data) => send_message(&mut writer, data, max_message_size).await,
                 Err(err) => Err(err),
@@ -1288,7 +1378,7 @@ pub struct CoreNetwork {
 }
 
 impl CoreNetwork {
-    /// Shared blocking exchange path; the frame is already encoded and owned by Rust.
+    /// Shared blocking exchange path; frames own snapshots or retain their exporters.
     fn exchange_encoded(
         &self,
         py: Python<'_>,
@@ -1594,9 +1684,9 @@ impl CoreNetwork {
         }
     }
 
-    /// Encode metadata and a contiguous uint8 NumPy view in one Rust allocation.
-    /// Python no longer constructs a large intermediate bytes object.
-    #[pyo3(signature = (key, meta, payload, timeout=None))]
+    /// Broadcast one NumPy payload to all neighbors. By default it is copied
+    /// once into an owned DATA snapshot; opt-in copy=false borrows its storage.
+    #[pyo3(signature = (key, meta, payload, timeout=None, *, copy=true))]
     pub fn exchange_array(
         &self,
         py: Python<'_>,
@@ -1604,39 +1694,54 @@ impl CoreNetwork {
         meta: &Bound<'_, PyBytes>,
         payload: PyReadonlyArray1<'_, u8>,
         timeout: Option<f64>,
+        copy: bool,
     ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
         let key = key.as_bytes();
         let meta = meta.as_bytes();
-        let payload = payload.as_slice().map_err(|_| {
+        let payload_bytes = payload.as_slice().map_err(|_| {
             PyValueError::new_err("payload must be a contiguous 1-D uint8 NumPy array")
         })?;
         let size = message::HEADER_SIZE
             .checked_add(key.len())
             .and_then(|size| size.checked_add(4))
             .and_then(|size| size.checked_add(meta.len()))
-            .and_then(|size| size.checked_add(payload.len()))
+            .and_then(|size| size.checked_add(payload_bytes.len()))
             .ok_or_else(|| PyValueError::new_err("Message too large"))?;
         if size > self.config.max_message_size {
             return Err(PyValueError::new_err("Message too large"));
         }
-        let encoded = message::encode_state(key, meta, payload)
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let frame = if copy {
+            // Keep the existing broadcast path: one shared Rust-owned snapshot.
+            DataFrame::Owned(
+                message::encode_state(key, meta, payload_bytes)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            )
+        } else {
+            // Borrow the *prepared* NumPy view, shared by all peer writers.
+            let head = message::encode_state(key, meta, &[])
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            // SAFETY: copy=false callers must not change the exported storage
+            // through any alias while background writers/replay may access it.
+            let borrowed = unsafe { BorrowedFrame::new(head, payload.as_any(), payload_bytes)? };
+            DataFrame::Borrowed(Arc::new(borrowed))
+        };
         self.exchange_encoded(
             py,
             Bytes::copy_from_slice(key),
-            ExchangeData::Broadcast(encoded),
+            ExchangeData::Broadcast(frame),
             timeout,
         )
     }
 
     /// Send a different NumPy state to each peer under the same exchange key.
-    #[pyo3(signature = (key, states, timeout=None))]
+    #[pyo3(signature = (key, states, timeout=None, *, copy=true))]
     pub fn neighborwise_exchange_array(
         &self,
         py: Python<'_>,
         key: &Bound<'_, PyBytes>,
         states: &Bound<'_, PyDict>,
         timeout: Option<f64>,
+        copy: bool,
     ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
         let key = key.as_bytes();
         if let Some(expected) = &self.neighbors {
@@ -1686,8 +1791,23 @@ impl CoreNetwork {
                 return Err(PyValueError::new_err("Message too large"));
             }
 
-            let frame = message::encode_state(key, meta.as_bytes(), payload)
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            let frame = if copy {
+                // Default: preserve the original independent DATA snapshot.
+                DataFrame::Owned(
+                    message::encode_state(key, meta.as_bytes(), payload)
+                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                )
+            } else {
+                // encode_state(key, meta, &[]) creates the unchanged DATA head.
+                // The TCP length prefix accounts for head + borrowed payload.
+                let head = message::encode_state(key, meta.as_bytes(), &[])
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                // SAFETY: The exporter is this exact contiguous NumPy uint8 view.
+                // copy=False callers promise no writes or storage invalidation
+                // through any alias until the last retained reference is gone.
+                let frame = unsafe { BorrowedFrame::new(head, &payload_obj, payload)? };
+                DataFrame::Borrowed(Arc::new(frame))
+            };
             frames.insert(peer_id, frame);
         }
 
@@ -1881,16 +2001,24 @@ mod neighborwise_tests {
 
     #[test]
     fn exchange_data_selects_per_peer_frames() {
-        let broadcast = ExchangeData::Broadcast(Bytes::from_static(b"same"));
-        assert_eq!(broadcast.for_peer("A").unwrap().as_ref(), b"same");
-        assert_eq!(broadcast.for_peer("B").unwrap().as_ref(), b"same");
+        let broadcast = ExchangeData::Broadcast(Bytes::from_static(b"same").into());
+        assert!(
+            matches!(broadcast.for_peer("A"), Some(DataFrame::Owned(f)) if f.as_ref() == b"same")
+        );
+        assert!(
+            matches!(broadcast.for_peer("B"), Some(DataFrame::Owned(f)) if f.as_ref() == b"same")
+        );
 
         let mut frames = HashMap::new();
-        frames.insert("A".into(), Bytes::from_static(b"to A"));
-        frames.insert("B".into(), Bytes::from_static(b"to B"));
+        frames.insert("A".into(), DataFrame::Owned(Bytes::from_static(b"to A")));
+        frames.insert("B".into(), DataFrame::Owned(Bytes::from_static(b"to B")));
         let neighborwise = ExchangeData::Neighborwise(frames);
-        assert_eq!(neighborwise.for_peer("A").unwrap().as_ref(), b"to A");
-        assert_eq!(neighborwise.for_peer("B").unwrap().as_ref(), b"to B");
+        assert!(
+            matches!(neighborwise.for_peer("A"), Some(DataFrame::Owned(f)) if f.as_ref() == b"to A")
+        );
+        assert!(
+            matches!(neighborwise.for_peer("B"), Some(DataFrame::Owned(f)) if f.as_ref() == b"to B")
+        );
         assert!(neighborwise.for_peer("C").is_none());
     }
 }
@@ -1903,7 +2031,7 @@ mod optimization_tests {
     async fn full_ack_queue_defers_without_disconnect_and_preserves_order() {
         let (tx, mut rx) = async_mpsc::channel(1);
         assert!(
-            tx.try_send(Outbound::Data(Bytes::from_static(b"first")))
+            tx.try_send(Outbound::Data(Bytes::from_static(b"first").into()))
                 .is_ok()
         );
         let mut backlog = AckBacklog::default();
@@ -1940,7 +2068,7 @@ mod optimization_tests {
     #[test]
     fn deferred_ack_memory_is_bounded() {
         let (tx, _rx) = async_mpsc::channel(1);
-        assert!(tx.try_send(Outbound::Data(Bytes::new())).is_ok());
+        assert!(tx.try_send(Outbound::Data(Bytes::new().into())).is_ok());
         let mut b = AckBacklog::default();
         for i in 0..MAX_DEFERRED_ACKS {
             b.queue(&tx, Bytes::copy_from_slice(&(i as u64).to_be_bytes()))
@@ -2074,7 +2202,7 @@ mod optimization_tests {
                 cmd_a
                     .send(Command::Exchange {
                         key: key.clone(),
-                        data: ExchangeData::Broadcast(frame_a),
+                        data: ExchangeData::Broadcast(frame_a.into()),
                         reply: reply_a,
                     })
                     .is_ok()
@@ -2085,7 +2213,10 @@ mod optimization_tests {
                 cmd_b
                     .send(Command::Exchange {
                         key,
-                        data: ExchangeData::Neighborwise(HashMap::from([("A".into(), frame_b)])),
+                        data: ExchangeData::Neighborwise(HashMap::from([(
+                            "A".into(),
+                            frame_b.into()
+                        )])),
                         reply: reply_b,
                     })
                     .is_ok()
@@ -2163,7 +2294,7 @@ mod optimization_tests {
                 commands
                     .send(Command::Exchange {
                         key: key.clone(),
-                        data: ExchangeData::Broadcast(local),
+                        data: ExchangeData::Broadcast(local.into()),
                         reply,
                     })
                     .is_ok()
@@ -2215,7 +2346,7 @@ mod optimization_tests {
             commands
                 .send(Command::Exchange {
                     key: key.clone(),
-                    data: ExchangeData::Broadcast(local.clone()),
+                    data: ExchangeData::Broadcast(local.clone().into()),
                     reply,
                 })
                 .is_ok()
@@ -2234,7 +2365,7 @@ mod optimization_tests {
                     commands
                         .send(Command::Exchange {
                             key: key.clone(),
-                            data: ExchangeData::Broadcast(local.clone()),
+                            data: ExchangeData::Broadcast(local.clone().into()),
                             reply,
                         })
                         .is_ok()
@@ -2253,5 +2384,78 @@ mod optimization_tests {
         assert_eq!(&result["B"][4..], b"must survive");
         let _ = stop.send(());
         worker.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod borrowed_frame_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_frame_is_shared_and_cache_counts_full_wire_body() {
+        Python::initialize();
+        Python::attach(|py| {
+            // An immutable exporter makes this Rust-only safety test independent
+            // of NumPy mutation rules. Production uses the prepared NumPy view.
+            let exporter = PyBytes::new(py, b"shared-payload");
+            let original_ptr = exporter.as_bytes().as_ptr();
+            let key = Bytes::from_static(b"k");
+            let head = message::encode_state(&key, b"meta", &[]).unwrap();
+            let expected_len = head.len() + exporter.as_bytes().len();
+            // SAFETY: immutable bytes, exact exporter, held by the memoryview.
+            let borrowed = unsafe {
+                BorrowedFrame::new(head, exporter.as_any(), exporter.as_bytes()).unwrap()
+            };
+            assert_eq!(borrowed.payload().as_ptr(), original_ptr);
+            let frame = DataFrame::Borrowed(Arc::new(borrowed));
+            let writer = frame.clone();
+            let weak = match &writer {
+                DataFrame::Borrowed(borrowed) => Arc::downgrade(borrowed),
+                _ => unreachable!(),
+            };
+            let mut cache = UnackedMessages::default();
+            cache
+                .check_capacity(&key, frame.len(), expected_len)
+                .unwrap();
+            cache.insert(key.clone(), frame);
+            assert_eq!(cache.bytes, expected_len);
+            assert!(
+                cache
+                    .check_capacity(&Bytes::from_static(b"next"), 1, expected_len)
+                    .is_err()
+            );
+            drop(exporter);
+            cache.acknowledge(&key);
+            assert_eq!(cache.bytes, 0);
+            // ACK cannot release memory still used by a writer.
+            assert!(weak.upgrade().is_some());
+            match &writer {
+                DataFrame::Borrowed(frame) => assert_eq!(frame.payload(), b"shared-payload"),
+                _ => unreachable!(),
+            }
+            drop(writer);
+            assert!(weak.upgrade().is_none());
+        });
+    }
+
+    #[test]
+    fn borrowed_and_owned_frames_have_identical_wire_content() {
+        Python::initialize();
+        Python::attach(|py| {
+            for payload in [b"".as_slice(), b"content".as_slice()] {
+                let exporter = PyBytes::new(py, payload);
+                let key = b"key";
+                let meta = b"metadata";
+                let owned = message::encode_state(key, meta, payload).unwrap();
+                let head = message::encode_state(key, meta, &[]).unwrap();
+                // SAFETY: immutable exporter and its exact byte slice.
+                let borrowed = unsafe {
+                    BorrowedFrame::new(head, exporter.as_any(), exporter.as_bytes()).unwrap()
+                };
+                let mut assembled = borrowed.head.to_vec();
+                assembled.extend_from_slice(borrowed.payload());
+                assert_eq!(assembled.as_slice(), owned.as_ref());
+            }
+        });
     }
 }
