@@ -64,12 +64,10 @@ class LiteNetwork:
         group_id: str = "default",
         transform: Transform | None = None,
         peer_endpoints: dict[str, str] | None = None,
-        close_wait: float = 2.0,
     ) -> None:
         self._node_id = node_id
         self._group_id = group_id
         self._transform = transform if transform is not None else Identity()
-        self._close_wait = close_wait
 
         self._context = zmq.Context()
 
@@ -79,7 +77,6 @@ class LiteNetwork:
         self._neighbor_id_bytes = [j.encode("utf-8") for j in self._neighbors]
 
         self._out_socket = self._context.socket(zmq.ROUTER)
-        self._out_socket.setsockopt(zmq.LINGER, int(close_wait * 1000))
 
         if peer_endpoints is None:
             port = self._out_socket.bind_to_random_port("tcp://*")
@@ -98,9 +95,7 @@ class LiteNetwork:
         self._dealers: dict[str, zmq.SyncSocket] = {}
         for peer_id in self._neighbors:
             dealer = self._context.socket(zmq.DEALER)
-            dealer.setsockopt(zmq.LINGER, 0)
             dealer.setsockopt(zmq.IDENTITY, identity)
-
             self._dealers[peer_id] = dealer
 
         if peer_endpoints is None:
@@ -129,14 +124,13 @@ class LiteNetwork:
     def weights(self) -> dict[str, float]:
         return self._neighbors
 
-    def close(self) -> None:
-        self._out_socket.close(linger=int(self._close_wait * 1000))
+    def close(self, timeout: float = 5.0) -> None:
+        self._out_socket.close(linger=int(timeout * 1000))
 
         for dealer in self._dealers.values():
             dealer.close(linger=0)
 
         self._dealers.clear()
-
         self._context.term()
 
         logger.info("[%s] Node closed.", self._node_id)
