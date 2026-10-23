@@ -99,7 +99,6 @@ def main() -> None:
     rust: Network | None = None
     lite: LiteNetwork | None = None
     rust_started = False
-    group_id = args.group_id or f"lan-benchmark-{os.getpid()}"
 
     print(
         f"Node {args.node_id} | six-node graph | neighbors={list(neighbors)} | "
