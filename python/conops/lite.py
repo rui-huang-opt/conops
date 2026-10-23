@@ -46,15 +46,14 @@ class LiteNetwork:
         Transformation applied to exchanged states. If ``None``,
         :class:`Identity` is used.
 
-    context : zmq.SyncContext | None, optional
-        ZeroMQ context used by the network. If ``None``, the process-wide
-        shared context returned by :meth:`zmq.Context.instance` is used.
-
     peer_endpoints : dict[str, str] | None, optional
         Mapping from neighbor node IDs to their TCP endpoints. If ``None``,
         the network will use Pyre for neighbor discovery. If provided, the
         network will connect directly to the specified endpoints, bypassing
         Pyre discovery.
+
+    close_wait : float, optional
+        Maximum time in seconds to retain pending outbound messages on close.
     """
 
     def __init__(
@@ -64,7 +63,6 @@ class LiteNetwork:
         *,
         group_id: str = "default",
         transform: Transform | None = None,
-        context: zmq.SyncContext | None = None,
         peer_endpoints: dict[str, str] | None = None,
         close_wait: float = 2.0,
     ) -> None:
@@ -72,10 +70,7 @@ class LiteNetwork:
         self._group_id = group_id
         self._transform = transform if transform is not None else Identity()
 
-        if context is None:
-            self._context: zmq.SyncContext = zmq.Context.instance()
-        else:
-            self._context = context
+        self._context = zmq.Context()
 
         self._neighbors = neighbors.copy()
         self._weight = 1.0 - sum(neighbors.values())
@@ -141,6 +136,8 @@ class LiteNetwork:
             dealer.close(linger=0)
 
         self._dealers.clear()
+
+        self._context.term()
 
         logger.info("[%s] Node closed.", self._node_id)
 
