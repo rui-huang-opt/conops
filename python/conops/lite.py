@@ -66,6 +66,7 @@ class LiteNetwork:
         transform: Transform | None = None,
         context: zmq.SyncContext | None = None,
         peer_endpoints: dict[str, str] | None = None,
+        close_wait: float = 2.0,
     ) -> None:
         self._node_id = node_id
         self._group_id = group_id
@@ -78,11 +79,12 @@ class LiteNetwork:
 
         self._neighbors = neighbors.copy()
         self._weight = 1.0 - sum(neighbors.values())
+        self._close_wait = close_wait
 
         self._neighbor_id_bytes = [j.encode("utf-8") for j in self._neighbors]
 
         self._out_socket = self._context.socket(zmq.ROUTER)
-        self._out_socket.setsockopt(zmq.LINGER, 0)
+        self._out_socket.setsockopt(zmq.LINGER, int(close_wait * 1000))
 
         if peer_endpoints is None:
             port = self._out_socket.bind_to_random_port("tcp://*")
@@ -133,7 +135,7 @@ class LiteNetwork:
         return self._neighbors
 
     def close(self) -> None:
-        self._out_socket.close(linger=0)
+        self._out_socket.close(linger=int(self._close_wait * 1000))
 
         for dealer in self._dealers.values():
             dealer.close(linger=0)
