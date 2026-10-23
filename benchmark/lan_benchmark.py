@@ -26,6 +26,27 @@ EDGES = [
     ("3", "6"),
 ]
 
+# Wired IP addresses. Assumes nodes 1-3 run on Windows/WSL (NUC),
+# and nodes 4-6 on the native Ubuntu laptop (HP).
+# Change this mapping if your actual node placement differs.
+NODE_IPS = {
+    "1": "169.254.8.118",  # NUC / WSL
+    "2": "169.254.8.118",  # NUC / WSL
+    "3": "169.254.8.118",  # NUC / WSL
+    "4": "169.254.201.105",  # HP / Ubuntu
+    "5": "169.254.201.105",  # HP / Ubuntu
+    "6": "169.254.201.105",  # HP / Ubuntu
+}
+RUST_PORT_BASE = 25000
+LITE_PORT_BASE = 26000
+
+
+def endpoints_for(node_ids, port_base: int) -> dict[str, str]:
+    return {
+        node_id: f"tcp://{NODE_IPS[node_id]}:{port_base + int(node_id)}"
+        for node_id in node_ids
+    }
+
 
 def measure_rust(
     network: Network,
@@ -94,6 +115,11 @@ def main() -> None:
         parser.error("Require n_state >= 1, n_iter >= 2, n_warmup >= 0, repeats >= 1")
 
     neighbors = Graph(NODES, EDGES)[args.node_id]
+    # Include exactly the local node and its neighbors (required by Network).
+    endpoint_nodes = [args.node_id, *neighbors]
+    rust_endpoints = endpoints_for(endpoint_nodes, RUST_PORT_BASE)
+    lite_endpoints = endpoints_for(endpoint_nodes, LITE_PORT_BASE)
+
     results: dict[str, list[float]] = {"Rust": [], "Lite": []}
     rust: Network | None = None
     lite: LiteNetwork | None = None
@@ -104,6 +130,11 @@ def main() -> None:
         f"Rust copy={args.copy} | group={args.group_id}",
         flush=True,
     )
+    print(
+        f"Node {args.node_id} | Rust endpoint={rust_endpoints[args.node_id]} | "
+        f"Lite endpoint={lite_endpoints[args.node_id]}",
+        flush=True,
+    )
 
     try:
         print(f"Node {args.node_id} | Rust: connecting once...", flush=True)
@@ -111,6 +142,7 @@ def main() -> None:
             node_id=args.node_id,
             neighbors=neighbors,
             group_id=f"{args.group_id}-rust",
+            peer_endpoints=rust_endpoints,
         )
         rust.start()
         rust_started = True
@@ -121,6 +153,7 @@ def main() -> None:
             node_id=args.node_id,
             neighbors=neighbors,
             group_id=f"{args.group_id}-lite",
+            peer_endpoints=lite_endpoints,
         )
         print(f"Node {args.node_id} | both backends connected", flush=True)
 
