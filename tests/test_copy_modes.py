@@ -1,4 +1,5 @@
-"""Three-process smoke test for Rust exchange(copy=True/False).
+"""
+Three-process smoke test for Rust exchange(copy=True/False).
 
 Run with: python tests/test_copy_modes.py
       or: python -m pytest -v tests/test_copy_modes.py
