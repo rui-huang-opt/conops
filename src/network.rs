@@ -98,7 +98,8 @@ struct ReceivedBuffer {
 #[pymethods]
 impl ReceivedBuffer {
     // SAFETY: `data` is immutable and owned by this object.
-    // The exported Py_buffer holds a strong reference to `slf`, so `data` cannot be freed until the consumer releases its view.
+    // The exported Py_buffer holds a strong reference to `slf`,
+    // so `data` cannot be freed until the consumer releases its view.
     // No reallocations are possible.
     unsafe fn __getbuffer__(
         slf: Bound<'_, Self>,
@@ -332,7 +333,8 @@ fn start_connect(
         };
 
         if let Err(err) = events.send(event) {
-            // Ensure a blocking Python connect() does not wait unnecessarily when the Tokio event loop has already shut down.
+            // Ensure a blocking Python connect() does not wait unnecessarily
+            // when the Tokio event loop has already shut down.
             match err.0 {
                 ConnectEvent::Established(e) => {
                     if let Some(reply) = e.reply {
@@ -586,8 +588,8 @@ async fn handshake(mut stream: TcpStream, my_id: &str) -> io::Result<(String, Tc
     Ok((peer_id.to_owned(), stream))
 }
 
-// The buffered reader lives for the entire session. It is never recreated
-// between frames and never cancelled by a per-exchange timeout.
+// The buffered reader lives for the entire session.
+// It is never recreated between frames and never cancelled by a per-exchange timeout.
 async fn read_peer(
     reader: OwnedReadHalf,
     peer: PeerIndex,

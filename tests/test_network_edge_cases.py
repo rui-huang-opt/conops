@@ -1,4 +1,5 @@
-"""Boundary tests for ConOps 0.5.1 neighborwise_exchange().
+"""
+Boundary tests for ConOps 0.5.1 neighborwise_exchange().
 
 Run from the project root, after installing the Rust extension:
     python tests/test_network_edge_cases.py

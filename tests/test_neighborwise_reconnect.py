@@ -1,4 +1,5 @@
-"""Test neighbor-specific DATA replay after a TCP disconnection.
+"""
+Test neighbor-specific DATA replay after a TCP disconnection.
 
 Run from the project root after installing the Rust extension:
     python tests/test_neighborwise_reconnect.py
