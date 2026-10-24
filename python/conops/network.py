@@ -165,8 +165,12 @@ class Network:
         """Return currently connected peer IDs."""
         return self._core.peers()
 
-    def close(self) -> None:
-        self._core.close()
+    def close(self, timeout: float = 5.0) -> None:
+        try:
+            if timeout != 0:
+                self._core.drain(timeout=timeout)
+        finally:
+            self._core.close()
 
     def _resolve_peer_endpoints(
         self,
@@ -232,8 +236,16 @@ class Network:
         *,
         key: ExchangeKey,
         timeout: float | None = None,
+        copy: bool = True,
     ) -> dict[str, NDArray]:
-        """Exchange ``state`` with all fixed neighbors using a semantic key."""
+        """Exchange ``state`` with all fixed neighbors using a semantic key.
+
+        ``copy=False`` borrows the prepared NumPy payload instead of creating
+        an independent Rust send snapshot. The submitted storage must not be
+        modified (including through aliases or reused Transform buffers) while
+        background send/replay may still access it. Exchange return or timeout
+        does not signal that this storage is free to overwrite.
+        """
         encoded_key = _encode_exchange_key(key)
         meta, payload = self._prepare(state)
         incoming = self._core.exchange_array(
@@ -241,6 +253,7 @@ class Network:
             meta,
             payload,
             timeout=timeout,
+            copy=copy,
         )
         return {peer_id: self._unpack(data) for peer_id, data in incoming.items()}
 
@@ -250,8 +263,18 @@ class Network:
         *,
         key: ExchangeKey,
         timeout: float | None = None,
+        copy: bool = True,
     ) -> dict[str, NDArray]:
-        """Exchange a different state with each neighbor under the same key."""
+        """Exchange a different state with each neighbor under the same key.
+
+        With ``copy=False``, the Rust sender borrows each prepared NumPy
+        payload instead of copying it into an owned frame. The submitted
+        memory (including aliases or shared Transform buffers) must remain
+        unchanged until its background send/replay references are released.
+        Returning or timing out does not certify buffer release. Use newly
+        allocated arrays for subsequent updates, or retain ``copy=True``
+        when the original storage may be overwritten.
+        """
         expected = set(self._neighbors)
         provided = set(state_map)
         if provided != expected:
@@ -270,6 +293,7 @@ class Network:
             key=encoded_key,
             states=prepared,
             timeout=timeout,
+            copy=copy,
         )
         return {peer_id: self._unpack(data) for peer_id, data in incoming.items()}
 
@@ -279,9 +303,10 @@ class Network:
         *,
         key: ExchangeKey,
         timeout: float | None = None,
+        copy: bool = True,
     ) -> NDArray:
         """Compute degree * state - sum(neighbor states)."""
-        received = self.exchange(state, key=key, timeout=timeout)
+        received = self.exchange(state, key=key, timeout=timeout, copy=copy)
         result = len(self._neighbors) * state
         for neighbor_state in received.values():
             result -= neighbor_state
@@ -293,9 +318,10 @@ class Network:
         *,
         key: ExchangeKey,
         timeout: float | None = None,
+        copy: bool = True,
     ) -> NDArray:
         """Compute (1 - sum(weights)) * state + sum(weight * neighbor state)."""
-        received = self.exchange(state, key=key, timeout=timeout)
+        received = self.exchange(state, key=key, timeout=timeout, copy=copy)
         result = (1.0 - sum(self._neighbors.values())) * state
         for peer_id, neighbor_state in received.items():
             result += self._neighbors[peer_id] * neighbor_state

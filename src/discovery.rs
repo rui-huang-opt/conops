@@ -1,3 +1,4 @@
+use std::time::Duration;
 use std::{
     collections::HashMap,
     net::{SocketAddr, SocketAddrV4},
@@ -6,6 +7,7 @@ use std::{
 use mdns_sd::{Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 pub const SERVICE_TYPE: &str = "_conops._tcp.local.";
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub struct DiscoveredPeer {
@@ -107,11 +109,14 @@ impl Discovery {
         }
     }
 
-    /// Stop advertising and browsing.
     pub fn close(self) -> mdns_sd::Result<()> {
         self.daemon.stop_browse(SERVICE_TYPE)?;
-        let _ = self.daemon.unregister(&self.fullname)?;
-        let _ = self.daemon.shutdown()?;
+
+        let unregister = self.daemon.unregister(&self.fullname)?;
+        let _ = unregister.recv_timeout(CLOSE_TIMEOUT);
+
+        let shutdown = self.daemon.shutdown()?;
+        let _ = shutdown.recv_timeout(CLOSE_TIMEOUT);
 
         Ok(())
     }

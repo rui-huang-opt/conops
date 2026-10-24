@@ -16,19 +16,15 @@ logger = getLogger(__name__)
 
 class LiteNetwork:
     """
-    Lightweight synchronous communication interface for fast state exchange.
+    Lightweight synchronous communication interface for state exchange.
 
-    Unlike :class:`Network`, which uses a background communication thread
-    and provides round-aware recovery, replay, and out-of-order message
-    handling, ``FastNetwork`` implements only the synchronous communication
-    path. Pyre is used for neighbor discovery during initialization, while
-    exchanged states are transmitted directly through ZeroMQ ROUTER/DEALER
-    sockets.
+    Unlike :class:`Network`, which provides round-aware message handling,
+    retransmission, and recovery mechanisms, LiteNetwork implements a
+    simpler communication path using ZeroMQ ROUTER/DEALER sockets.
+    Pyre is used for neighbor discovery unless explicit peer endpoints are provided.
 
-    This reduces protocol overhead at the cost of omitting the recovery
-    semantics provided by :class:`Network`. ``FastNetwork`` is therefore
-    intended for synchronized and performance-sensitive experiments where
-    application-level recovery is not required.
+    This implementation is primarily intended for lightweight,
+    synchronized distributed optimization experiments.
 
     Parameters
     ----------
@@ -46,15 +42,29 @@ class LiteNetwork:
         Transformation applied to exchanged states. If ``None``,
         :class:`Identity` is used.
 
-    context : zmq.SyncContext | None, optional
-        ZeroMQ context used by the network. If ``None``, the process-wide
-        shared context returned by :meth:`zmq.Context.instance` is used.
-
     peer_endpoints : dict[str, str] | None, optional
-        Mapping from neighbor node IDs to their TCP endpoints. If ``None``,
-        the network will use Pyre for neighbor discovery. If provided, the
-        network will connect directly to the specified endpoints, bypassing
-        Pyre discovery.
+        Mapping from node IDs to their TCP endpoints. If ``None``,
+        Pyre is used for neighbor discovery. Otherwise, the network
+        connects directly to the specified endpoints.
+
+    close_wait : float, optional
+        Maximum time in seconds to retain pending outbound messages
+        during shutdown.
+
+    Notes
+    -----
+    LiteNetwork retains the legacy ZeroMQ-based implementation used in
+    earlier research experiments. Its behavior is intentionally preserved
+    primarily for backward compatibility and reproducibility of
+    previously published results.
+
+    In particular, outgoing payloads are submitted to ZeroMQ with
+    ``copy=False``. This behavior is generally compatible with common
+    out-of-place state updates in iterative optimization algorithms,
+    but it does not guarantee safety when outgoing buffers are modified
+    while transmission is still pending.
+
+    Users should be aware of these limitations when using LiteNetwork.
     """
 
     def __init__(
@@ -64,17 +74,13 @@ class LiteNetwork:
         *,
         group_id: str = "default",
         transform: Transform | None = None,
-        context: zmq.SyncContext | None = None,
         peer_endpoints: dict[str, str] | None = None,
     ) -> None:
         self._node_id = node_id
         self._group_id = group_id
         self._transform = transform if transform is not None else Identity()
 
-        if context is None:
-            self._context: zmq.SyncContext = zmq.Context.instance()
-        else:
-            self._context = context
+        self._context = zmq.Context()
 
         self._neighbors = neighbors.copy()
         self._weight = 1.0 - sum(neighbors.values())
@@ -82,7 +88,6 @@ class LiteNetwork:
         self._neighbor_id_bytes = [j.encode("utf-8") for j in self._neighbors]
 
         self._out_socket = self._context.socket(zmq.ROUTER)
-        self._out_socket.setsockopt(zmq.LINGER, 0)
 
         if peer_endpoints is None:
             port = self._out_socket.bind_to_random_port("tcp://*")
@@ -101,9 +106,7 @@ class LiteNetwork:
         self._dealers: dict[str, zmq.SyncSocket] = {}
         for peer_id in self._neighbors:
             dealer = self._context.socket(zmq.DEALER)
-            dealer.setsockopt(zmq.LINGER, 0)
             dealer.setsockopt(zmq.IDENTITY, identity)
-
             self._dealers[peer_id] = dealer
 
         if peer_endpoints is None:
@@ -132,13 +135,14 @@ class LiteNetwork:
     def weights(self) -> dict[str, float]:
         return self._neighbors
 
-    def close(self) -> None:
-        self._out_socket.close(linger=0)
+    def close(self, timeout: float = 5.0) -> None:
+        self._out_socket.close(linger=int(timeout * 1000))
 
         for dealer in self._dealers.values():
             dealer.close(linger=0)
 
         self._dealers.clear()
+        self._context.term()
 
         logger.info("[%s] Node closed.", self._node_id)
 
@@ -147,7 +151,9 @@ class LiteNetwork:
         Bootstrap the network using Pyre for discovery, then establish
         direct ZeroMQ connections to all neighbors.
         """
-        pyre_node = pyre.Pyre(self._node_id, ctx=self._context)
+        # Pyre uses its own context, separate from the data context.
+        pyre_node = pyre.Pyre(self._node_id)
+        success = False
 
         try:
             pyre_node.set_header("port", str(port))
@@ -156,16 +162,18 @@ class LiteNetwork:
 
             endpoints = self._discover_neighbors(pyre_node)
             self._connect_to_neighbors(endpoints)
-
-        except Exception:
-            self.close()
-            raise
+            success = True
 
         finally:
             try:
                 pyre_node.stop()
             except Exception:
                 logger.exception("[%s] Failed to stop Pyre node.", self._node_id)
+            finally:
+                pyre_node.inbox.close(linger=0)
+
+            if not success:
+                self.close()
 
     def _create_sockets(self) -> int:
         self._out_socket = self._context.socket(zmq.ROUTER)
@@ -259,18 +267,42 @@ class LiteNetwork:
         key: object | None = None,
     ) -> dict[str, NDArray]:
         """
-        Exchanges the given state map with all neighbor nodes.
+        Exchanges distinct states with neighboring nodes.
 
-        This method broadcasts the state map to all neighbors and then gathers their states.
+        Each neighbor receives the corresponding state in ``state_map``,
+        and the states received from all neighbors are returned.
 
-        Args:
-            state_map (dict[str, NDArray[np.float64]]): The state map to exchange with neighbors.
+        Parameters
+        ----------
+        state_map : dict[str, NDArray]
+            Mapping from neighbor node IDs to the states to be sent.
+            The keys must match the configured neighbors.
 
-            key (object | None, optional): Accepted for API compatibility with Network,
-            but ignored by LiteNetwork. Defaults to None.
+        key : object | None, optional
+            Accepted for API compatibility with Network, but ignored by
+            LiteNetwork. Defaults to None.
 
-        Returns:
-            dict[str, NDArray[np.float64]]: A dictionary mapping neighbor names to their received state maps.
+        Returns
+        -------
+        dict[str, NDArray]
+            Mapping from neighbor node IDs to their received states.
+
+        Notes
+        -----
+        Outgoing payloads are submitted to ZeroMQ with ``copy=False``.
+        ZeroMQ may continue using the underlying buffers after this method
+        returns, so returning does not guarantee that transmission has
+        completed.
+
+        This behavior is generally compatible with out-of-place state
+        updates commonly used in iterative optimization algorithms, where
+        new arrays are created without modifying previously sent data.
+        However, it is not a universal safety guarantee.
+
+        In-place modifications, writes through shared views, or buffer
+        reuse by custom transforms may alter data still being transmitted.
+        Callers must ensure that the underlying payload buffers remain
+        unchanged until ZeroMQ has finished using them.
         """
         if self._out_socket is None:
             raise RuntimeError("FastNetwork is not bound")
@@ -304,18 +336,41 @@ class LiteNetwork:
         key: object | None = None,
     ) -> dict[str, NDArray]:
         """
-        Exchanges the given state with all neighbor nodes.
+        Exchanges the given state with all neighboring nodes.
 
-        This method broadcasts the state to all neighbors and then gathers their states.
+        The same state is sent to every neighbor, and the states received
+        from all neighbors are returned.
 
-        Args:
-            state (NDArray[np.float64]): The state array to exchange with neighbors.
+        Parameters
+        ----------
+        state : NDArray
+            State to be sent to all neighboring nodes.
 
-            key (object | None, optional): Accepted for API compatibility with Network,
-            but ignored by LiteNetwork. Defaults to None.
+        key : object | None, optional
+            Accepted for API compatibility with Network, but ignored by
+            LiteNetwork. Defaults to None.
 
-        Returns:
-            dict[str, NDArray[np.float64]]: A dictionary mapping neighbor names to their received state arrays.
+        Returns
+        -------
+        dict[str, NDArray]
+            Mapping from neighbor node IDs to their received states.
+
+        Notes
+        -----
+        The outgoing payload is submitted to ZeroMQ with ``copy=False``.
+        ZeroMQ may continue using the underlying buffer after this method
+        returns, so returning does not guarantee that transmission has
+        completed.
+
+        This behavior is generally compatible with out-of-place updates
+        commonly used in iterative optimization algorithms, such as
+        ``x = x - step * grad``, which leave previously sent data unchanged.
+        However, it does not guarantee safety in all usage scenarios.
+
+        In-place updates such as ``x -= step * grad``, writes through shared
+        views, or buffer reuse by custom transforms may modify data still
+        being transmitted. Callers must ensure that the underlying payload
+        buffer remains unchanged until ZeroMQ has finished using it.
         """
         if self._out_socket is None:
             raise RuntimeError("FastNetwork is not bound")

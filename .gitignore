@@ -15,3 +15,9 @@
 
 # Development
 .vscode/
+
+# Network captures
+*.pcap
+*.pcapng
+*.pcap.gz
+*.pcapng.gz

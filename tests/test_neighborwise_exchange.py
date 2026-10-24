@@ -7,17 +7,11 @@ Run after building the Rust extension:
 
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
-from typing import Protocol
 import socket
 
 import numpy as np
 
 from conops import Network
-
-
-class BarrierLike(Protocol):
-    def wait(self, timeout: float | None = None) -> int: ...
-
 
 NODE_IDS = ("1", "2", "3")
 
@@ -33,11 +27,7 @@ def available_ports(count: int) -> list[int]:
             sock.close()
 
 
-def worker(
-    node_id: str,
-    endpoints: dict[str, str],
-    barrier: BarrierLike,
-) -> str:
+def worker(node_id: str, endpoints: dict[str, str]) -> str:
     neighbors = {peer_id: 0.25 for peer_id in NODE_IDS if peer_id != node_id}
     network = Network(node_id, neighbors, peer_endpoints=endpoints)
     try:
@@ -80,7 +70,6 @@ def worker(
         else:
             raise AssertionError("Missing neighbor states were not rejected")
 
-        barrier.wait(timeout=30)
         return node_id
     finally:
         network.close()
@@ -93,15 +82,12 @@ def test_neighborwise_exchange() -> None:
     }
 
     ctx = get_context("spawn")
-    with ctx.Manager() as manager:
-        barrier = manager.Barrier(len(NODE_IDS))
-
-        with ProcessPoolExecutor(max_workers=len(NODE_IDS), mp_context=ctx) as executor:
-            futures = [
-                executor.submit(worker, node_id, endpoints, barrier)
-                for node_id in NODE_IDS
-            ]
-            results = [future.result(timeout=90) for future in futures]
+    with ProcessPoolExecutor(max_workers=len(NODE_IDS), mp_context=ctx) as executor:
+        futures = [
+            executor.submit(worker, node_id, endpoints)
+            for node_id in NODE_IDS
+        ]
+        results = [future.result(timeout=90) for future in futures]
 
     assert set(results) == set(NODE_IDS)
 

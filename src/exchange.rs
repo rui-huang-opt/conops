@@ -1,21 +1,71 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
-/// Collects exactly one message from each peer for an exchange.
+/// Stable for the lifetime of a Network, including across TCP reconnections.
+/// Indices are local to a Network and are never sent on the wire.
+pub type PeerIndex = usize;
+
+/// Immutable topology snapshot. Fixed-topology networks create this only once;
+/// manual-mode networks rebuild it only when their connected peer set changes.
+#[derive(Debug)]
+pub struct PeerLayout {
+    peers: Vec<(PeerIndex, String)>,
+    slots: Vec<Option<usize>>,
+}
+
+impl PeerLayout {
+    pub fn new(mut peers: Vec<(PeerIndex, String)>) -> Self {
+        peers.sort_unstable_by_key(|(index, _)| *index);
+        let capacity = peers.last().map_or(0, |(index, _)| index + 1);
+        let mut slots = vec![None; capacity];
+        for (slot, (index, _)) in peers.iter().enumerate() {
+            assert!(
+                slots[*index].replace(slot).is_none(),
+                "Duplicate peer index"
+            );
+        }
+        Self { peers, slots }
+    }
+
+    pub fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
+    pub fn slot(&self, index: PeerIndex) -> Option<usize> {
+        self.slots.get(index).copied().flatten()
+    }
+
+    pub fn peers(&self) -> &[(PeerIndex, String)] {
+        &self.peers
+    }
+}
+
+/// One payload per neighbor, without rebuilding a String HashSet/HashMap for
+/// every exchange. Payloads are moved, not copied; slot storage can be recycled.
 #[derive(Debug)]
 pub struct Batch {
     key: Bytes,
-    expected: HashSet<String>,
-    received: HashMap<String, Bytes>,
+    layout: Arc<PeerLayout>,
+    received: Vec<Option<Bytes>>,
+    remaining: usize,
 }
 
 impl Batch {
-    pub fn new(key: Bytes, peers: Vec<String>) -> Self {
+    pub fn new(key: Bytes, layout: Arc<PeerLayout>, mut recycled: Vec<Option<Bytes>>) -> Self {
+        recycled.clear();
+        recycled.resize_with(layout.len(), || None);
+        let remaining = layout.len();
         Self {
             key,
-            expected: peers.into_iter().collect(),
-            received: HashMap::new(),
+            layout,
+            received: recycled,
+            remaining,
         }
     }
 
@@ -23,35 +73,58 @@ impl Batch {
         &self.key
     }
 
-    pub fn insert(&mut self, peer: String, payload: Bytes) -> Result<bool, &'static str> {
-        if !self.expected.contains(&peer) {
-            return Err("Unexpected peer");
-        }
-        if self.received.contains_key(&peer) {
+    pub fn expects(&self, peer: PeerIndex) -> bool {
+        self.layout.slot(peer).is_some()
+    }
+
+    pub fn insert(&mut self, peer: PeerIndex, payload: Bytes) -> Result<bool, &'static str> {
+        let slot = self.layout.slot(peer).ok_or("Unexpected peer")?;
+        if self.received[slot].is_some() {
             return Ok(false);
         }
-        self.received.insert(peer, payload);
+        self.received[slot] = Some(payload);
+        self.remaining -= 1;
         Ok(true)
     }
 
     pub fn is_complete(&self) -> bool {
-        self.received.len() == self.expected.len()
+        self.remaining == 0
     }
 
-    pub fn take(self) -> Result<HashMap<String, Bytes>, Self> {
-        if self.is_complete() {
-            Ok(self.received)
-        } else {
-            Err(self)
+    /// String keys are materialized only at the Python-facing result boundary.
+    /// The returned slot vector has retained capacity and contains no payloads.
+    pub fn take(mut self) -> Result<(HashMap<String, Bytes>, Vec<Option<Bytes>>), Self> {
+        if !self.is_complete() {
+            return Err(self);
         }
+        let mut result = HashMap::with_capacity(self.layout.len());
+        for (slot, (_, name)) in self.layout.peers().iter().enumerate() {
+            result.insert(
+                name.clone(),
+                self.received[slot].take().expect("complete batch"),
+            );
+        }
+        self.received.clear();
+        Ok((result, self.received))
+    }
+
+    pub fn recycle(mut self) -> Vec<Option<Bytes>> {
+        self.received.clear();
+        self.received
     }
 }
 
-/// Messages for exchange keys not yet started locally.
-/// In sequential exchange programs a peer can be one exchange ahead.
+#[derive(Debug)]
+struct EarlyEntry {
+    key: Bytes,
+    payload: Bytes,
+}
+
+/// One future DATA per peer, as in the original sequential-exchange contract.
+/// Storage is indexed by stable peer index, not nested key/String hash maps.
 #[derive(Debug)]
 pub struct EarlyMessages {
-    messages: HashMap<Bytes, HashMap<String, Bytes>>,
+    entries: Vec<Option<EarlyEntry>>,
     count: usize,
     bytes: usize,
     max_messages: usize,
@@ -61,7 +134,7 @@ pub struct EarlyMessages {
 impl EarlyMessages {
     pub fn new(max_messages: usize, max_bytes: usize) -> Self {
         Self {
-            messages: HashMap::new(),
+            entries: Vec::new(),
             count: 0,
             bytes: 0,
             max_messages,
@@ -69,69 +142,77 @@ impl EarlyMessages {
         }
     }
 
+    /// Called on registration, never with an index supplied by a remote peer.
+    pub fn reserve_peers(&mut self, count: usize) {
+        if self.entries.len() < count {
+            self.entries.resize_with(count, || None);
+        }
+    }
+
     pub fn insert(
         &mut self,
         key: Bytes,
-        peer: String,
+        peer: PeerIndex,
         payload: Bytes,
     ) -> Result<bool, &'static str> {
-        if self
-            .messages
-            .get(&key)
-            .is_some_and(|messages| messages.contains_key(&peer))
-        {
-            return Ok(false);
+        if let Some(Some(entry)) = self.entries.get(peer) {
+            return if entry.key == key {
+                Ok(false)
+            } else {
+                Err("Peer already has an early exchange message")
+            };
         }
-
-        // A single active Exchange per node means a correctly ordered peer
-        // should never have more than one *future* DATA outstanding here.
-        if self
-            .messages
-            .values()
-            .any(|messages| messages.contains_key(&peer))
-        {
-            return Err("Peer already has an early exchange message");
-        }
-
         if self.count >= self.max_messages
             || payload.len() > self.max_bytes.saturating_sub(self.bytes)
         {
             return Err("Early message buffer full");
         }
-
+        self.reserve_peers(peer + 1);
         self.count += 1;
         self.bytes += payload.len();
-        self.messages.entry(key).or_default().insert(peer, payload);
+        self.entries[peer] = Some(EarlyEntry { key, payload });
         Ok(true)
     }
 
-    pub fn take(&mut self, key: &Bytes) -> HashMap<String, Bytes> {
-        let messages = self.messages.remove(key).unwrap_or_default();
-        self.count -= messages.len();
-        self.bytes -= messages.values().map(Bytes::len).sum::<usize>();
-        messages
+    /// Non-destructive validation. This must precede any early-data removal.
+    pub fn check_batch(&self, batch: &Batch) -> Result<(), &'static str> {
+        for (peer, entry) in self.entries.iter().enumerate() {
+            if let Some(entry) = entry {
+                if &entry.key == batch.key() && !batch.expects(peer) {
+                    return Err("Unexpected peer in early message cache");
+                }
+            }
+        }
+        Ok(())
     }
 
-    /// Remove cached data from a disconnected peer if explicitly requested.
-    pub fn remove_peer(&mut self, peer_id: &str) {
-        let keys: Vec<Bytes> = self.messages.keys().cloned().collect();
-        for key in keys {
-            let mut empty = false;
-            if let Some(messages) = self.messages.get_mut(&key) {
-                if let Some(data) = messages.remove(peer_id) {
-                    self.count -= 1;
-                    self.bytes -= data.len();
-                }
-                empty = messages.is_empty();
+    /// Transactional with respect to validation errors: on Err, nothing moves.
+    /// Call only after every outbound permit and unacked budget is reserved.
+    pub fn fill_batch(&mut self, batch: &mut Batch) -> Result<(), &'static str> {
+        self.check_batch(batch)?;
+        for (peer, slot) in self.entries.iter_mut().enumerate() {
+            if slot.as_ref().is_some_and(|entry| &entry.key == batch.key()) {
+                let entry = slot.take().expect("checked early entry");
+                self.count -= 1;
+                self.bytes -= entry.payload.len();
+                // check_batch() established membership; duplicate inserts are safe.
+                batch
+                    .insert(peer, entry.payload)
+                    .expect("validated early peer");
             }
-            if empty {
-                self.messages.remove(&key);
-            }
+        }
+        Ok(())
+    }
+
+    pub fn remove_peer(&mut self, peer: PeerIndex) {
+        if let Some(entry) = self.entries.get_mut(peer).and_then(Option::take) {
+            self.count -= 1;
+            self.bytes -= entry.payload.len();
         }
     }
 }
 
-/// Bounded record of completed or cancelled keys; stores keys, not payloads.
+/// Bounded record, unchanged: callers must not deliberately reuse old keys.
 #[derive(Debug)]
 pub struct CompletedKeys {
     keys: HashSet<Bytes>,
@@ -169,85 +250,88 @@ impl CompletedKeys {
 mod tests {
     use super::*;
 
-    fn key(text: &'static [u8]) -> Bytes {
-        Bytes::from_static(text)
+    fn key(s: &'static [u8]) -> Bytes {
+        Bytes::from_static(s)
+    }
+    fn layout() -> Arc<PeerLayout> {
+        Arc::new(PeerLayout::new(vec![(2, "B".into()), (7, "C".into())]))
     }
 
     #[test]
-    fn test_batch() {
-        let mut batch = Batch::new(key(b"y"), vec!["B".into(), "C".into()]);
-        assert_eq!(batch.key(), &key(b"y"));
-        assert!(!batch.is_complete());
-        assert_eq!(batch.insert("B".into(), key(b"123")), Ok(true));
-        assert_eq!(batch.insert("B".into(), key(b"456")), Ok(false));
-        assert_eq!(batch.insert("C".into(), key(b"789")), Ok(true));
-        assert!(batch.is_complete());
-        assert_eq!(batch.received["B"].as_ref(), b"123");
-        assert_eq!(batch.received["C"].as_ref(), b"789");
-        assert!(batch.insert("D".into(), key(b"bad")).is_err());
+    fn indexed_batch_duplicate_and_unexpected_peer() {
+        let mut b = Batch::new(key(b"k"), layout(), Vec::new());
+        assert_eq!(b.insert(2, key(b"first")), Ok(true));
+        assert_eq!(b.insert(2, key(b"duplicate")), Ok(false));
+        assert!(b.insert(1, key(b"bad")).is_err());
+        assert!(!b.is_complete());
+        assert_eq!(b.insert(7, key(b"second")), Ok(true));
+        let (r, slots) = b.take().unwrap();
+        assert_eq!(&r["B"][..], b"first");
+        assert_eq!(&r["C"][..], b"second");
+        assert!(slots.is_empty());
+        assert!(slots.capacity() >= 2);
     }
 
     #[test]
-    fn test_take() {
-        let mut batch = Batch::new(key(b"x"), vec!["B".into(), "C".into()]);
-        batch.insert("B".into(), key(b"Hello B")).unwrap();
-        let mut batch = batch.take().unwrap_err();
-        batch.insert("C".into(), key(b"Hello C")).unwrap();
-        let received = batch.take().unwrap();
-        assert_eq!(received["B"].as_ref(), b"Hello B");
-        assert_eq!(received["C"].as_ref(), b"Hello C");
+    fn storage_is_reused_without_retaining_old_payloads() {
+        let mut b = Batch::new(key(b"one"), layout(), Vec::new());
+        b.insert(2, key(b"a")).unwrap();
+        b.insert(7, key(b"b")).unwrap();
+        let ptr = b.received.as_ptr();
+        let (_, recycled) = b.take().unwrap();
+        let b = Batch::new(key(b"two"), layout(), recycled);
+        assert_eq!(b.received.as_ptr(), ptr);
+        assert!(b.received.iter().all(Option::is_none));
+        assert!(!b.is_complete());
     }
 
     #[test]
-    fn test_empty_batch() {
-        let batch = Batch::new(key(b"x"), vec![]);
-        assert!(batch.is_complete());
-        assert!(batch.take().unwrap().is_empty());
+    fn empty_batch_completes() {
+        let b = Batch::new(key(b"k"), Arc::new(PeerLayout::new(Vec::new())), Vec::new());
+        assert!(b.is_complete());
+        assert!(b.take().unwrap().0.is_empty());
     }
 
     #[test]
-    fn test_early_messages_unordered_keys() {
-        let mut early = EarlyMessages::new(10, 1024);
-        assert_eq!(early.insert(key(b"z"), "A".into(), key(b"A")), Ok(true));
-        assert_eq!(early.insert(key(b"a"), "B".into(), key(b"B")), Ok(true));
-        assert_eq!(early.insert(key(b"z"), "C".into(), key(b"C")), Ok(true));
-        assert_eq!(
-            early.insert(key(b"z"), "A".into(), key(b"duplicate")),
-            Ok(false)
-        );
-        // One early DATA per peer: other future keys cannot accumulate.
-        assert!(early.insert(key(b"next"), "A".into(), key(b"bad")).is_err());
-        let messages = early.take(&key(b"z"));
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages["A"].as_ref(), b"A");
-        assert_eq!(messages["C"].as_ref(), b"C");
-        assert_eq!(early.take(&key(b"a"))["B"].as_ref(), b"B");
+    fn early_validation_does_not_destroy_acknowledged_data() {
+        let mut e = EarlyMessages::new(8, 1024);
+        e.insert(key(b"k"), 2, key(b"a")).unwrap();
+        e.insert(key(b"k"), 7, key(b"b")).unwrap();
+        let wrong = Arc::new(PeerLayout::new(vec![(2, "B".into())]));
+        let mut b = Batch::new(key(b"k"), wrong, Vec::new());
+        assert!(e.fill_batch(&mut b).is_err());
+        assert_eq!(e.count, 2);
+        assert_eq!(e.bytes, 2);
+        let mut b = Batch::new(key(b"k"), layout(), b.recycle());
+        e.fill_batch(&mut b).unwrap();
+        assert!(b.is_complete());
+        assert_eq!((e.count, e.bytes), (0, 0));
     }
 
     #[test]
-    fn test_early_limits_and_reclaim() {
-        let mut early = EarlyMessages::new(2, 5);
-        assert_eq!(early.insert(key(b"z"), "A".into(), key(b"123")), Ok(true));
-        assert!(early.insert(key(b"z"), "B".into(), key(b"456")).is_err());
-        assert_eq!(early.insert(key(b"a"), "B".into(), key(b"4")), Ok(true));
-        assert!(early.insert(key(b"c"), "C".into(), Bytes::new()).is_err());
-        let _ = early.take(&key(b"z"));
-        assert_eq!(early.insert(key(b"c"), "C".into(), key(b"5678")), Ok(true));
-        early.remove_peer("B");
-        assert!(early.take(&key(b"a")).is_empty());
-        assert_eq!(early.take(&key(b"c"))["C"].as_ref(), b"5678");
+    fn early_limits_duplicates_and_unordered_keys() {
+        let mut e = EarlyMessages::new(2, 5);
+        assert_eq!(e.insert(key(b"z"), 2, key(b"123")), Ok(true));
+        assert_eq!(e.insert(key(b"z"), 2, key(b"duplicate")), Ok(false));
+        assert!(e.insert(key(b"next"), 2, Bytes::new()).is_err());
+        assert!(e.insert(key(b"z"), 7, key(b"456")).is_err());
+        e.insert(key(b"a"), 7, key(b"4")).unwrap();
+        assert!(e.insert(key(b"c"), 8, Bytes::new()).is_err());
+        let mut b = Batch::new(key(b"z"), layout(), Vec::new());
+        e.fill_batch(&mut b).unwrap();
+        assert_eq!((e.count, e.bytes), (1, 1));
+        e.remove_peer(7);
+        assert_eq!((e.count, e.bytes), (0, 0));
     }
 
     #[test]
-    fn test_completed_keys_are_bounded() {
-        let mut history = CompletedKeys::new(2);
-        history.insert(key(b"z"));
-        history.insert(key(b"a"));
-        history.insert(key(b"z")); // duplicate does not change eviction order
-        assert!(history.contains(&key(b"z")));
-        history.insert(key(b"q"));
-        assert!(!history.contains(&key(b"z")));
-        assert!(history.contains(&key(b"a")));
-        assert!(history.contains(&key(b"q")));
+    fn completed_keys_remain_bounded() {
+        let mut h = CompletedKeys::new(2);
+        h.insert(key(b"z"));
+        h.insert(key(b"a"));
+        h.insert(key(b"z"));
+        h.insert(key(b"q"));
+        assert!(!h.contains(&key(b"z")));
+        assert!(h.contains(&key(b"a")) && h.contains(&key(b"q")));
     }
 }

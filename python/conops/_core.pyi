@@ -23,11 +23,16 @@ class CoreNetwork:
         meta: bytes,
         payload: NDArray[np.uint8],
         timeout: float | None = None,
+        *,
+        copy: bool = True,
     ) -> dict[str, memoryview]: ...
     def neighborwise_exchange_array(
         self,
         key: bytes,
         states: dict[str, tuple[bytes, NDArray[np.uint8]]],
         timeout: float | None = None,
+        *,
+        copy: bool = True,
     ) -> dict[str, memoryview]: ...
+    def drain(self, timeout: float = 5.0) -> None: ...
     def close(self) -> None: ...
