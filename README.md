@@ -4,7 +4,8 @@
 
 It provides two communication implementations:
 
-- **`Network`** — a Rust-backed TCP implementation with neighbor discovery, explicit exchange matching, acknowledgment-based message tracking, and connection recovery.
+- **`Network`** — a Rust-backed TCP implementation with neighbor discovery, automatic exchange IDs, acknowledgment-based message tracking, and connection recovery.
+
 - **`LiteNetwork`** — the original Python/ZeroMQ-based implementation, retained for backward compatibility and reproducibility of earlier research results. It provides a simpler communication mechanism without explicit message matching or recovery.
 
 Both implementations offer a similar interface for exchanging NumPy arrays and performing common consensus operations.
@@ -83,6 +84,7 @@ Each node needs only its own `node_id` and a dictionary mapping neighbor IDs to 
 The Rust-backed `Network` supports two connection modes:
 
 - **Automatic discovery (default):** mDNS discovers configured neighbors on a local network.
+
 - **Manual configuration:** `peer_endpoints` supplies TCP addresses directly, which is useful on servers and in Kubernetes environments where multicast discovery may not be available.
 
 For example, a node may be initialized as follows:
@@ -102,15 +104,15 @@ network.wait_connected(timeout=30)
 
 Once connected, the node can exchange NumPy arrays and apply operators such as `laplacian()` and `weighted_mix()`.
 
-Each exchange is identified by a **key**, which must be consistent across neighboring nodes for the same logical exchange. Keys need not be monotonically increasing, but should be unique for distinct exchanges. For example:
+The Rust-backed `Network` assigns an internal, monotonically increasing exchange ID automatically. No explicit `key` argument is required or supported:
 
 ```python
-network.exchange(x, key="initial")
-network.laplacian(x, key=(0, "x"))
-network.laplacian(y, key=(0, "y"))
+network.exchange(x)
+network.laplacian(x)
+network.laplacian(y)
 ```
 
-The current implementation supports integer keys, string keys, and `(int, str)` tuples.
+Each successful call advances the internal exchange ID, including calls to `exchange()`, `neighborwise_exchange()`, `laplacian()`, and `weighted_mix()`. All participating neighbors must invoke matching communication operations in the same logical order. If an exchange fails, the exchange session is invalidated; close and restart the network before beginning a new session.
 
 When configured manually, `peer_endpoints` maps the local node and its neighbors to endpoints, for example:
 
@@ -139,8 +141,8 @@ By default, `copy=True` creates a snapshot of the outgoing payload, allowing the
 Setting `copy=False` avoids this additional payload copy and may reduce memory overhead, particularly when exchanging large NumPy arrays.
 
 ```python
-network.exchange(x, key=(0, "x"), copy=False)
-network.laplacian(x, key=(0, "y"), copy=False)
+network.exchange(x, copy=False)
+network.laplacian(x, copy=False)
 ```
 
 With `copy=False`, the communication backend retains a reference to the underlying payload while it may still be needed for transmission or retransmission. Consequently, the payload must remain unchanged during this period, potentially even after the exchange method returns.
@@ -215,7 +217,7 @@ try:
     network.wait_connected(timeout=30)
 
     for k in range(50):
-        x = x - alpha * network.laplacian(x, key=(k, "x"))
+        x = x - alpha * network.laplacian(x)
 
 finally:
     network.close()
@@ -244,14 +246,11 @@ network = LiteNetwork(node_id=node_id, neighbors=neighbors)
 
 try:
     for k in range(50):
-        x = x - alpha * network.laplacian(x, key=(k, "x"))
-        # Or x = x - alpha * network.laplacian(x)
+        x = x - alpha * network.laplacian(x)
 
 finally:
     network.close()
 ```
-
-The `key` argument is accepted for API compatibility with `Network`, but is ignored by `LiteNetwork`. Existing calls without a key, such as `network.laplacian(x)`, remain valid.
 
 ### Legacy Behavior and Limitations
 
