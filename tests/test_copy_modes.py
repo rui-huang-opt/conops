@@ -57,12 +57,7 @@ def run_node(node_id: str, endpoints: dict[str, str]) -> bool:
             for step in range(3):
                 # Broadcast: the same payload goes to two neighbors.
                 state = np.full(N_STATE, 100 * int(node_id) + step, dtype=np.float64)
-                received = network.exchange(
-                    state,
-                    key=f"broadcast-{copy}-{step}",
-                    timeout=TIMEOUT,
-                    copy=copy,
-                )
+                received = network.exchange(state, timeout=TIMEOUT, copy=copy)
                 assert set(received) == set(neighbors)
                 for peer_id, value in received.items():
                     np.testing.assert_array_equal(
@@ -77,14 +72,14 @@ def run_node(node_id: str, endpoints: dict[str, str]) -> bool:
                 dtype = np.float64 if step % 2 == 0 else np.int64
                 state_map = {
                     peer_id: np.full(
-                        N_STATE, 1000 * int(node_id) + 100 * int(peer_id) + step,
+                        N_STATE,
+                        1000 * int(node_id) + 100 * int(peer_id) + step,
                         dtype=dtype,
                     )
                     for peer_id in neighbors
                 }
                 received = network.neighborwise_exchange(
                     state_map,
-                    key=f"neighborwise-{copy}-{step}",
                     timeout=TIMEOUT,
                     copy=copy,
                 )
@@ -99,23 +94,13 @@ def run_node(node_id: str, endpoints: dict[str, str]) -> bool:
 
                 # These convenience methods must forward the copy option.
                 x = np.full(32, float(node_id), dtype=np.float64)
-                laplacian = network.laplacian(
-                    x,
-                    key=f"laplacian-{copy}-{step}",
-                    timeout=TIMEOUT,
-                    copy=copy,
-                )
+                laplacian = network.laplacian(x, timeout=TIMEOUT, copy=copy)
                 expected_laplacian = len(neighbors) * int(node_id) - sum(
                     int(peer_id) for peer_id in neighbors
                 )
                 np.testing.assert_array_equal(laplacian, expected_laplacian)
 
-                mixed = network.weighted_mix(
-                    x,
-                    key=f"weighted-{copy}-{step}",
-                    timeout=TIMEOUT,
-                    copy=copy,
-                )
+                mixed = network.weighted_mix(x, timeout=TIMEOUT, copy=copy)
                 expected_mix = (1.0 - sum(neighbors.values())) * int(node_id)
                 expected_mix += sum(
                     weight * int(peer_id) for peer_id, weight in neighbors.items()

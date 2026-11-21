@@ -263,8 +263,6 @@ class LiteNetwork:
     def neighborwise_exchange(
         self,
         state_map: dict[str, NDArray],
-        *,
-        key: object | None = None,
     ) -> dict[str, NDArray]:
         """
         Exchanges distinct states with neighboring nodes.
@@ -277,10 +275,6 @@ class LiteNetwork:
         state_map : dict[str, NDArray]
             Mapping from neighbor node IDs to the states to be sent.
             The keys must match the configured neighbors.
-
-        key : object | None, optional
-            Accepted for API compatibility with Network, but ignored by
-            LiteNetwork. Defaults to None.
 
         Returns
         -------
@@ -329,12 +323,7 @@ class LiteNetwork:
 
         return neighbor_states
 
-    def exchange(
-        self,
-        state: NDArray,
-        *,
-        key: object | None = None,
-    ) -> dict[str, NDArray]:
+    def exchange(self, state: NDArray) -> dict[str, NDArray]:
         """
         Exchanges the given state with all neighboring nodes.
 
@@ -345,10 +334,6 @@ class LiteNetwork:
         ----------
         state : NDArray
             State to be sent to all neighboring nodes.
-
-        key : object | None, optional
-            Accepted for API compatibility with Network, but ignored by
-            LiteNetwork. Defaults to None.
 
         Returns
         -------
@@ -388,7 +373,7 @@ class LiteNetwork:
 
         return neighbor_states
 
-    def laplacian(self, state: NDArray, *, key: object | None = None) -> NDArray:
+    def laplacian(self, state: NDArray) -> NDArray:
         """
         Computes the Laplacian of the given state vector based on the states of neighboring nodes.
 
@@ -398,9 +383,6 @@ class LiteNetwork:
 
         Args:
             state (NDArray[float64]): The state vector of the current node.
-
-            key (object | None, optional): Accepted for API compatibility with Network,
-            but ignored by LiteNetwork. Defaults to None.
 
         Returns:
             NDArray[float64]: The Laplacian vector representing the difference between the current state and the average state of its neighbors.
@@ -412,7 +394,7 @@ class LiteNetwork:
 
         return laplacian
 
-    def weighted_mix(self, state: NDArray, *, key: object | None = None) -> NDArray:
+    def weighted_mix(self, state: NDArray) -> NDArray:
         """
         Performs the weighted mixing operation for distributed optimization using the weight matrix W.
 
@@ -426,9 +408,6 @@ class LiteNetwork:
 
         Args:
             state (NDArray[np.float64]): The current state vector of node i.
-
-            key (object | None, optional): Accepted for API compatibility with Network,
-            but ignored by LiteNetwork. Defaults to None.
 
         Returns:
             NDArray[float64]: The mixed state vector corresponding to the i-th row of Wx.

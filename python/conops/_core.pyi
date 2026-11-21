@@ -19,7 +19,6 @@ class CoreNetwork:
     def wait_connected(self, timeout: float | None = None) -> None: ...
     def exchange_array(
         self,
-        key: bytes,
         meta: bytes,
         payload: NDArray[np.uint8],
         timeout: float | None = None,
@@ -28,7 +27,6 @@ class CoreNetwork:
     ) -> dict[str, memoryview]: ...
     def neighborwise_exchange_array(
         self,
-        key: bytes,
         states: dict[str, tuple[bytes, NDArray[np.uint8]]],
         timeout: float | None = None,
         *,

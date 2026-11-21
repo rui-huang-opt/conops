@@ -3,7 +3,7 @@ use std::{
     ffi::{c_int, c_void},
     future, io, ptr,
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -50,6 +50,7 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 // Per-neighbor unacknowledged DATA is bounded (shared frames, no replay copy).
 const MAX_UNACKED_MESSAGES: usize = 4;
 const DEFAULT_MAX_UNACKED_BYTES: usize = 128 * 1024 * 1024;
+const EXCHANGE_KEY_SIZE: usize = std::mem::size_of::<u64>();
 
 /// Limits are per Network instance, not global process settings.
 #[derive(Clone, Copy)]
@@ -61,13 +62,13 @@ struct NetworkConfig {
 
 impl NetworkConfig {
     fn validate(&self) -> PyResult<()> {
-        // DATA frames have a 3-byte fixed header, at least one key byte,
-        // and a 4-byte metadata length. TCP framing uses a 32-bit length.
-        if self.max_message_size < message::HEADER_SIZE + 1 + 4
+        // DATA frames have a fixed 8-byte exchange ID and a 4-byte metadata length.
+        // TCP framing uses a 32-bit length.
+        if self.max_message_size < message::HEADER_SIZE + EXCHANGE_KEY_SIZE + 4
             || self.max_message_size > u32::MAX as usize
         {
             return Err(PyValueError::new_err(
-                "max_message_size must be between 8 and 4294967295 bytes",
+                "max_message_size must be between 15 and 4294967295 bytes",
             ));
         }
         if self.max_unacked_bytes < self.max_message_size {
@@ -1366,6 +1367,12 @@ async fn run_network(
     info!("[{node_id}] Stopped");
 }
 
+#[derive(Default)]
+struct ExchangeSession {
+    next_id: u64,
+    failed: bool,
+}
+
 #[pyclass]
 pub struct CoreNetwork {
     node_id: String,
@@ -1374,38 +1381,65 @@ pub struct CoreNetwork {
     group_id: String,
     peer_endpoints: Option<HashMap<String, String>>,
     config: NetworkConfig,
+    exchange_session: Mutex<ExchangeSession>,
     commands: Option<async_mpsc::UnboundedSender<Command>>,
     stop_tx: Option<oneshot::Sender<()>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl CoreNetwork {
+    /// Permit one synchronous exchange at a time and reject a failed session.
+    fn lock_exchange(&self) -> PyResult<MutexGuard<'_, ExchangeSession>> {
+        let session = self
+            .exchange_session
+            .try_lock()
+            .map_err(|_| PyRuntimeError::new_err("Another exchange is in progress"))?;
+        if session.failed {
+            return Err(PyRuntimeError::new_err(
+                "Exchange session has failed; close and restart the network",
+            ));
+        }
+        if self.commands.is_none() {
+            return Err(PyRuntimeError::new_err("Node is not started"));
+        }
+        if session.next_id == u64::MAX {
+            return Err(PyRuntimeError::new_err("Exchange ID exhausted"));
+        }
+        Ok(session)
+    }
+
+    fn exchange_duration(timeout: Option<f64>) -> PyResult<Option<Duration>> {
+        timeout
+            .map(|timeout| {
+                Duration::try_from_secs_f64(timeout).map_err(|_| {
+                    PyValueError::new_err("timeout must be finite, nonnegative, and representable")
+                })
+            })
+            .transpose()
+    }
+
+    fn exchange_deadline(duration: Option<Duration>) -> PyResult<Option<Instant>> {
+        duration
+            .map(|duration| {
+                Instant::now()
+                    .checked_add(duration)
+                    .ok_or_else(|| PyValueError::new_err("timeout is too large"))
+            })
+            .transpose()
+    }
+
     /// Shared blocking exchange path; frames own snapshots or retain their exporters.
     fn exchange_encoded(
         &self,
         py: Python<'_>,
         key: Bytes,
         data: ExchangeData,
-        timeout: Option<f64>,
+        deadline: Option<Instant>,
     ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
-        let duration = timeout
-            .map(|timeout| {
-                Duration::try_from_secs_f64(timeout).map_err(|_| {
-                    PyValueError::new_err("timeout must be finite, nonnegative, and representable")
-                })
-            })
-            .transpose()?;
         let commands = self
             .commands
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Node is not started"))?;
-        let deadline = duration
-            .map(|duration| {
-                Instant::now()
-                    .checked_add(duration)
-                    .ok_or_else(|| PyValueError::new_err("timeout is too large"))
-            })
-            .transpose()?;
         let (reply, mut result_rx) = mpsc::channel();
         commands
             .send(Command::Exchange {
@@ -1543,6 +1577,7 @@ impl CoreNetwork {
             group_id: group_id.to_owned(),
             peer_endpoints,
             config,
+            exchange_session: Mutex::new(ExchangeSession::default()),
             commands: None,
             stop_tx: None,
             worker: None,
@@ -1553,6 +1588,8 @@ impl CoreNetwork {
         if self.worker.is_some() {
             return Err(PyRuntimeError::new_err("Node already started"));
         }
+        // A new start is a new training session; all nodes must start together.
+        self.exchange_session = Mutex::new(ExchangeSession::default());
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let (command_tx, command_rx) = async_mpsc::unbounded_channel();
@@ -1683,23 +1720,22 @@ impl CoreNetwork {
 
     /// Broadcast one NumPy payload to all neighbors. By default it is copied
     /// once into an owned DATA snapshot; opt-in copy=false borrows its storage.
-    #[pyo3(signature = (key, meta, payload, timeout=None, *, copy=true))]
+    #[pyo3(signature = (meta, payload, timeout=None, *, copy=true))]
     pub fn exchange_array(
         &self,
         py: Python<'_>,
-        key: &Bound<'_, PyBytes>,
         meta: &Bound<'_, PyBytes>,
         payload: PyReadonlyArray1<'_, u8>,
         timeout: Option<f64>,
         copy: bool,
     ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
-        let key = key.as_bytes();
+        let duration = Self::exchange_duration(timeout)?;
         let meta = meta.as_bytes();
         let payload_bytes = payload.as_slice().map_err(|_| {
             PyValueError::new_err("payload must be a contiguous 1-D uint8 NumPy array")
         })?;
         let size = message::HEADER_SIZE
-            .checked_add(key.len())
+            .checked_add(EXCHANGE_KEY_SIZE)
             .and_then(|size| size.checked_add(4))
             .and_then(|size| size.checked_add(meta.len()))
             .and_then(|size| size.checked_add(payload_bytes.len()))
@@ -1707,40 +1743,45 @@ impl CoreNetwork {
         if size > self.config.max_message_size {
             return Err(PyValueError::new_err("Message too large"));
         }
+        let mut session = self.lock_exchange()?;
+        let key = Bytes::copy_from_slice(&session.next_id.to_be_bytes());
         let frame = if copy {
             // Keep the existing broadcast path: one shared Rust-owned snapshot.
             DataFrame::Owned(
-                message::encode_state(key, meta, payload_bytes)
+                message::encode_state(&key, meta, payload_bytes)
                     .map_err(|err| PyValueError::new_err(err.to_string()))?,
             )
         } else {
             // Borrow the *prepared* NumPy view, shared by all peer writers.
-            let head = message::encode_state(key, meta, &[])
+            let head = message::encode_state(&key, meta, &[])
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
             // SAFETY: copy=false callers must not change the exported storage
             // through any alias while background writers/replay may access it.
             let borrowed = unsafe { BorrowedFrame::new(head, payload.as_any(), payload_bytes)? };
             DataFrame::Borrowed(Arc::new(borrowed))
         };
-        self.exchange_encoded(
-            py,
-            Bytes::copy_from_slice(key),
-            ExchangeData::Broadcast(frame),
-            timeout,
-        )
+        let deadline = Self::exchange_deadline(duration)?;
+        let result = self.exchange_encoded(py, key, ExchangeData::Broadcast(frame), deadline);
+        if result.is_ok() {
+            session.next_id += 1;
+        } else {
+            // After submission, the outcome may already be visible to peers.
+            // Do not allow this process to enter another logical exchange.
+            session.failed = true;
+        }
+        result
     }
 
-    /// Send a different NumPy state to each peer under the same exchange key.
-    #[pyo3(signature = (key, states, timeout=None, *, copy=true))]
+    /// Send a different NumPy state to each peer under one internal exchange ID.
+    #[pyo3(signature = (states, timeout=None, *, copy=true))]
     pub fn neighborwise_exchange_array(
         &self,
         py: Python<'_>,
-        key: &Bound<'_, PyBytes>,
         states: &Bound<'_, PyDict>,
         timeout: Option<f64>,
         copy: bool,
     ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
-        let key = key.as_bytes();
+        let duration = Self::exchange_duration(timeout)?;
         if let Some(expected) = &self.neighbors {
             if states.len() != expected.len() {
                 return Err(PyValueError::new_err(
@@ -1749,7 +1790,8 @@ impl CoreNetwork {
             }
         }
 
-        let mut frames = HashMap::with_capacity(states.len());
+        // Validate every neighbor's input before checking the network session.
+        let mut prepared = Vec::with_capacity(states.len());
         for (peer_id, state) in states.iter() {
             let peer_id: String = peer_id.extract()?;
             if self
@@ -1774,46 +1816,59 @@ impl CoreNetwork {
             let meta = meta_obj.cast::<PyBytes>()?;
             let payload_obj = pair.get_item(1)?;
             let payload = payload_obj.extract::<PyReadonlyArray1<'_, u8>>()?;
-            let payload = payload.as_slice().map_err(|_| {
+            let payload_bytes = payload.as_slice().map_err(|_| {
                 PyValueError::new_err("payload must be a contiguous 1-D uint8 NumPy array")
             })?;
 
             let size = message::HEADER_SIZE
-                .checked_add(key.len())
+                .checked_add(EXCHANGE_KEY_SIZE)
                 .and_then(|size| size.checked_add(4))
                 .and_then(|size| size.checked_add(meta.as_bytes().len()))
-                .and_then(|size| size.checked_add(payload.len()))
+                .and_then(|size| size.checked_add(payload_bytes.len()))
                 .ok_or_else(|| PyValueError::new_err("Message too large"))?;
             if size > self.config.max_message_size {
                 return Err(PyValueError::new_err("Message too large"));
             }
 
+            prepared.push((peer_id, meta_obj, payload_obj, payload));
+        }
+
+        let mut session = self.lock_exchange()?;
+        let key = Bytes::copy_from_slice(&session.next_id.to_be_bytes());
+        let mut frames = HashMap::with_capacity(prepared.len());
+        for (peer_id, meta_obj, payload_obj, payload) in prepared {
+            let meta = meta_obj.cast::<PyBytes>()?;
+            let payload_bytes = payload.as_slice().map_err(|_| {
+                PyValueError::new_err("payload must be a contiguous 1-D uint8 NumPy array")
+            })?;
             let frame = if copy {
                 // Default: preserve the original independent DATA snapshot.
                 DataFrame::Owned(
-                    message::encode_state(key, meta.as_bytes(), payload)
+                    message::encode_state(&key, meta.as_bytes(), payload_bytes)
                         .map_err(|err| PyValueError::new_err(err.to_string()))?,
                 )
             } else {
                 // encode_state(key, meta, &[]) creates the unchanged DATA head.
                 // The TCP length prefix accounts for head + borrowed payload.
-                let head = message::encode_state(key, meta.as_bytes(), &[])
+                let head = message::encode_state(&key, meta.as_bytes(), &[])
                     .map_err(|err| PyValueError::new_err(err.to_string()))?;
                 // SAFETY: The exporter is this exact contiguous NumPy uint8 view.
                 // copy=False callers promise no writes or storage invalidation
                 // through any alias until the last retained reference is gone.
-                let frame = unsafe { BorrowedFrame::new(head, &payload_obj, payload)? };
+                let frame = unsafe { BorrowedFrame::new(head, &payload_obj, payload_bytes)? };
                 DataFrame::Borrowed(Arc::new(frame))
             };
             frames.insert(peer_id, frame);
         }
 
-        self.exchange_encoded(
-            py,
-            Bytes::copy_from_slice(key),
-            ExchangeData::Neighborwise(frames),
-            timeout,
-        )
+        let deadline = Self::exchange_deadline(duration)?;
+        let result = self.exchange_encoded(py, key, ExchangeData::Neighborwise(frames), deadline);
+        if result.is_ok() {
+            session.next_id += 1;
+        } else {
+            session.failed = true;
+        }
+        result
     }
 
     /// Wait for outbound DATA acknowledgments and locally queued ACK writes.
@@ -1873,6 +1928,41 @@ impl CoreNetwork {
 #[cfg(test)]
 mod ack_tests {
     use super::*;
+
+    #[test]
+    fn exchange_id_is_committed_only_after_success() {
+        let mut network = CoreNetwork::new(
+            "A".into(),
+            0,
+            None,
+            "test",
+            None,
+            DEFAULT_MAX_MESSAGE_SIZE,
+            DEFAULT_MAX_UNACKED_BYTES,
+            DEFAULT_MAX_EARLY_BYTES,
+        )
+        .unwrap();
+        assert!(network.lock_exchange().is_err());
+
+        let (tx, _rx) = async_mpsc::unbounded_channel();
+        network.commands = Some(tx);
+        {
+            let session = network.lock_exchange().unwrap();
+            assert_eq!(session.next_id, 0);
+            // Local preparation failed; releasing this guard does not use an ID.
+        }
+        {
+            let mut session = network.lock_exchange().unwrap();
+            assert_eq!(session.next_id, 0);
+            session.next_id += 1; // Simulate a completed exchange.
+        }
+        {
+            let mut session = network.lock_exchange().unwrap();
+            assert_eq!(session.next_id, 1);
+            session.failed = true; // Simulate a failed submitted exchange.
+        }
+        assert!(network.lock_exchange().is_err());
+    }
 
     #[test]
     fn unacked_is_bounded_and_ack_releases_space() {

@@ -31,7 +31,6 @@ GRAPH = Graph(NODES, EDGES)
 def measure_rust(
     network: Network,
     node_id: str,
-    repeat: int,
     n_state: int,
     n_iter: int,
     n_warmup: int,
@@ -43,19 +42,18 @@ def measure_rust(
     y = npr.uniform(-100.0, 100.0, n_state)
 
     for k in range(n_warmup):
-        network.exchange(x, key=f"warmup-{repeat}-{k}", copy=copy)
+        network.exchange(x, copy=copy)
 
     before = time.perf_counter()
     for k in range(n_iter - 1):
-        x = x - 0.45 * network.laplacian(x, key=(k, f"{repeat}-x"), copy=copy)
-        y = y - 0.20 * network.laplacian(y, key=(k, f"{repeat}-y"), copy=copy)
+        x = x - 0.45 * network.laplacian(x, copy=copy)
+        y = y - 0.20 * network.laplacian(y, copy=copy)
     return time.perf_counter() - before
 
 
 def measure_lite(
     network: LiteNetwork,
     node_id: str,
-    repeat: int,
     n_state: int,
     n_iter: int,
     n_warmup: int,
@@ -65,12 +63,12 @@ def measure_lite(
     y = npr.uniform(-100.0, 100.0, n_state)
 
     for k in range(n_warmup):
-        network.exchange(x, key=f"warmup-{repeat}-{k}")
+        network.exchange(x)
 
     before = time.perf_counter()
     for k in range(n_iter - 1):
-        x = x - 0.45 * network.laplacian(x, key=(k, f"{repeat}-x"))
-        y = y - 0.20 * network.laplacian(y, key=(k, f"{repeat}-y"))
+        x = x - 0.45 * network.laplacian(x)
+        y = y - 0.20 * network.laplacian(y)
     return time.perf_counter() - before
 
 
@@ -112,7 +110,6 @@ def benchmark_node(
                 rust_elapsed = measure_rust(
                     network=rust,
                     node_id=node_id,
-                    repeat=repeat,
                     n_state=n_state,
                     n_iter=n_iter,
                     n_warmup=n_warmup,
@@ -123,7 +120,6 @@ def benchmark_node(
                 lite_elapsed = measure_lite(
                     network=lite,
                     node_id=node_id,
-                    repeat=repeat,
                     n_state=n_state,
                     n_iter=n_iter,
                     n_warmup=n_warmup,
@@ -133,7 +129,6 @@ def benchmark_node(
                 lite_elapsed = measure_lite(
                     network=lite,
                     node_id=node_id,
-                    repeat=repeat,
                     n_state=n_state,
                     n_iter=n_iter,
                     n_warmup=n_warmup,
@@ -143,7 +138,6 @@ def benchmark_node(
                 rust_elapsed = measure_rust(
                     network=rust,
                     node_id=node_id,
-                    repeat=repeat,
                     n_state=n_state,
                     n_iter=n_iter,
                     n_warmup=n_warmup,

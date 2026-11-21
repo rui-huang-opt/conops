@@ -45,7 +45,7 @@ def consensus(
         network.wait_connected(timeout=30)
 
         for k in range(n_iter - 1):
-            x[k + 1] = network.weighted_mix(state=x[k], key=k)
+            x[k + 1] = network.weighted_mix(state=x[k])
     finally:
         network.close()
 

@@ -56,7 +56,7 @@ def run_node(backend: str, node_id: str, endpoints: dict[str, str]) -> bool:
 
             for k in range(N_EXCHANGES):
                 state = np.full(4096, 100 * int(node_id) + k, dtype=np.float64)
-                received = network.exchange(state, key=k, timeout=TIMEOUT)
+                received = network.exchange(state, timeout=TIMEOUT)
                 assert set(received) == set(neighbors)
                 for peer_id, value in received.items():
                     np.testing.assert_array_equal(
@@ -77,7 +77,7 @@ def run_node(backend: str, node_id: str, endpoints: dict[str, str]) -> bool:
         try:
             for k in range(N_EXCHANGES):
                 state = np.full(4096, 100 * int(node_id) + k, dtype=np.float64)
-                received = network.exchange(state, key=k)
+                received = network.exchange(state)
                 assert set(received) == set(neighbors)
                 for peer_id, value in received.items():
                     np.testing.assert_array_equal(
@@ -99,7 +99,9 @@ def run_processes(backend: str) -> None:
     }
     ctx = get_context("spawn")
     with ProcessPoolExecutor(max_workers=len(NODES), mp_context=ctx) as executor:
-        tasks = [executor.submit(run_node, backend, node_id, endpoints) for node_id in NODES]
+        tasks = [
+            executor.submit(run_node, backend, node_id, endpoints) for node_id in NODES
+        ]
         assert all(task.result(timeout=90) for task in tasks)
 
 
@@ -164,6 +166,10 @@ def test_rust_close_waits_for_ack() -> None:
                 assert len(data) >= 7 and data[0] == 0  # DATA frame
                 key_size = struct.unpack_from("!H", data, 1)[0]
                 key = data[3 : 3 + key_size]
+
+                assert key_size == 8
+                assert key == (0).to_bytes(8, "big")
+
                 body_start = 3 + key_size
                 meta_size = struct.unpack_from("!I", data, body_start)[0]
                 end_of_meta = body_start + 4 + meta_size
@@ -197,9 +203,7 @@ def test_rust_close_waits_for_ack() -> None:
         try:
             network.start()
             network.wait_connected(timeout=TIMEOUT)
-            received = network.exchange(
-                np.array([111.0]), key="final", timeout=TIMEOUT
-            )
+            received = network.exchange(np.array([111.0]), timeout=TIMEOUT)
             np.testing.assert_array_equal(received["2"], [222.0])
             assert got_local_ack.wait(TIMEOUT)
 

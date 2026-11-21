@@ -1,4 +1,5 @@
-"""Benchmark ConOps exchange() on a persistent six-node LAN topology.
+"""
+Benchmark ConOps exchange() on a persistent six-node LAN topology.
 
 Run once per node with the same options and a different --node_id.
 Rust and Lite connect once and reuse their connections across repeats.
@@ -30,7 +31,6 @@ EDGES = [
 def measure_rust(
     network: Network,
     node_id: str,
-    repeat: int,
     n_state: int,
     n_iter: int,
     n_warmup: int,
@@ -41,19 +41,18 @@ def measure_rust(
     y = npr.uniform(-100.0, 100.0, n_state)
 
     for k in range(n_warmup):
-        network.exchange(x, key=f"warmup-{repeat}-{k}", copy=copy)
+        network.exchange(x, copy=copy)
 
     before = time.perf_counter()
     for k in range(n_iter - 1):
-        x = x - 0.25 * network.laplacian(x, key=(k, f"{repeat}-x"), copy=copy)
-        y = y - 0.20 * network.laplacian(y, key=(k, f"{repeat}-y"), copy=copy)
+        x = x - 0.25 * network.laplacian(x, copy=copy)
+        y = y - 0.20 * network.laplacian(y, copy=copy)
     return time.perf_counter() - before
 
 
 def measure_lite(
     network: LiteNetwork,
     node_id: str,
-    repeat: int,
     n_state: int,
     n_iter: int,
     n_warmup: int,
@@ -63,12 +62,12 @@ def measure_lite(
     y = npr.uniform(-100.0, 100.0, n_state)
 
     for k in range(n_warmup):
-        network.exchange(x, key=f"warmup-{repeat}-{k}")
+        network.exchange(x)
 
     before = time.perf_counter()
     for k in range(n_iter - 1):
-        x = x - 0.25 * network.laplacian(x, key=(k, f"{repeat}-x"))
-        y = y - 0.20 * network.laplacian(y, key=(k, f"{repeat}-y"))
+        x = x - 0.25 * network.laplacian(x)
+        y = y - 0.20 * network.laplacian(y)
     return time.perf_counter() - before
 
 
@@ -129,7 +128,6 @@ def main() -> None:
                 rust_elapsed = measure_rust(
                     network=rust,
                     node_id=args.node_id,
-                    repeat=repeat,
                     n_state=args.n_state,
                     n_iter=args.n_iter,
                     n_warmup=args.n_warmup,
@@ -145,7 +143,6 @@ def main() -> None:
                 lite_elapsed = measure_lite(
                     network=lite,
                     node_id=args.node_id,
-                    repeat=repeat,
                     n_state=args.n_state,
                     n_iter=args.n_iter,
                     n_warmup=args.n_warmup,
@@ -160,7 +157,6 @@ def main() -> None:
                 lite_elapsed = measure_lite(
                     network=lite,
                     node_id=args.node_id,
-                    repeat=repeat,
                     n_state=args.n_state,
                     n_iter=args.n_iter,
                     n_warmup=args.n_warmup,
@@ -175,7 +171,6 @@ def main() -> None:
                 rust_elapsed = measure_rust(
                     network=rust,
                     node_id=args.node_id,
-                    repeat=repeat,
                     n_state=args.n_state,
                     n_iter=args.n_iter,
                     n_warmup=args.n_warmup,

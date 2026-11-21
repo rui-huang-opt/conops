@@ -42,7 +42,7 @@ def consensus(
         network.wait_connected(timeout=30)
 
         for k in range(n_iter - 1):
-            x[k + 1] = x[k] - alpha * network.laplacian(x[k], key=k)
+            x[k + 1] = x[k] - alpha * network.laplacian(x[k])
 
     finally:
         network.close()

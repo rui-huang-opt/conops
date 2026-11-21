@@ -65,7 +65,6 @@ def check_received(
 def measure_rust(
     network: Network,
     node_id: str,
-    repeat: int,
     n_iter: int,
     n_state: int,
     n_warmup: int,
@@ -73,41 +72,22 @@ def measure_rust(
 ) -> float:
     x_map, y_map = make_state_maps(node_id, list(network.neighbors), n_state)
 
-    for state_map, key, offset in (
-        (x_map, f"check-{repeat}-x", 0),
-        (y_map, f"check-{repeat}-y", 10000),
-    ):
+    for state_map, offset in ((x_map, 0), (y_map, 10000)):
         received = network.neighborwise_exchange(
             state_map,
-            key=key,
             timeout=EXCHANGE_TIMEOUT,
             copy=copy,
         )
         check_received(received, state_map, node_id, n_state, offset)
 
     for k in range(n_warmup):
-        network.neighborwise_exchange(
-            x_map,
-            key=f"warmup-{repeat}-{k}",
-            timeout=EXCHANGE_TIMEOUT,
-            copy=copy,
-        )
+        network.neighborwise_exchange(x_map, timeout=EXCHANGE_TIMEOUT, copy=copy)
 
     before = time.perf_counter()
     for k in range(n_iter - 1):
-        network.neighborwise_exchange(
-            x_map,
-            key=(k, f"{repeat}-x"),
-            timeout=EXCHANGE_TIMEOUT,
-            copy=copy,
-        )
+        network.neighborwise_exchange(x_map, timeout=EXCHANGE_TIMEOUT, copy=copy)
 
-        network.neighborwise_exchange(
-            y_map,
-            key=(k, f"{repeat}-y"),
-            timeout=EXCHANGE_TIMEOUT,
-            copy=copy,
-        )
+        network.neighborwise_exchange(y_map, timeout=EXCHANGE_TIMEOUT, copy=copy)
 
     return time.perf_counter() - before
 
@@ -126,16 +106,16 @@ def measure_lite(
         (x_map, f"check-{repeat}-x", 0),
         (y_map, f"check-{repeat}-y", 10000),
     ):
-        received = network.neighborwise_exchange(state_map, key=key)
+        received = network.neighborwise_exchange(state_map)
         check_received(received, state_map, node_id, n_state, offset)
 
     for k in range(n_warmup):
-        network.neighborwise_exchange(x_map, key=f"warmup-{repeat}-{k}")
+        network.neighborwise_exchange(x_map)
 
     before = time.perf_counter()
     for k in range(n_iter - 1):
-        network.neighborwise_exchange(x_map, key=(k, f"{repeat}-x"))
-        network.neighborwise_exchange(y_map, key=(k, f"{repeat}-y"))
+        network.neighborwise_exchange(x_map)
+        network.neighborwise_exchange(y_map)
     return time.perf_counter() - before
 
 
@@ -176,7 +156,6 @@ def benchmark_node(
                 rust_elapsed = measure_rust(
                     network=rust,
                     node_id=node_id,
-                    repeat=repeat,
                     n_iter=n_iter,
                     n_state=n_state,
                     n_warmup=n_warmup,
@@ -208,7 +187,6 @@ def benchmark_node(
                 rust_elapsed = measure_rust(
                     network=rust,
                     node_id=node_id,
-                    repeat=repeat,
                     n_iter=n_iter,
                     n_state=n_state,
                     n_warmup=n_warmup,

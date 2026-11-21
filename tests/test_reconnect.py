@@ -1,7 +1,7 @@
 """
 Test ConOps TCP reconnection and unacknowledged DATA replay.
 
-Two worker processes communicate through a local TCP proxy. At exchange key 3,
+Two worker processes communicate through a local TCP proxy. At exchange ID 3,
 the proxy drops both DATA frames, closes the TCP connection, and allows the
 Rust backend to reconnect and replay them.
 
@@ -15,7 +15,6 @@ import struct
 import threading
 import time
 
-import msgspec
 import numpy as np
 
 from conops import Network
@@ -55,7 +54,7 @@ class FaultProxy:
     def __init__(self, target_port: int, cut_exchange: int):
         self.target_port = target_port
         self.cut_exchange = cut_exchange
-        self.cut_key = msgspec.msgpack.encode(cut_exchange)
+        self.cut_key = cut_exchange.to_bytes(8, "big")
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.listener.bind(("127.0.0.1", 0))
@@ -199,7 +198,7 @@ def worker(node_id: str, endpoints: dict[str, str]) -> tuple[str, list[float]]:
         for k in range(N_EXCHANGES):
             state = np.array([int(node_id), k], dtype=np.int64)
             start = time.perf_counter()
-            received = network.exchange(state, key=k, timeout=EXCHANGE_TIMEOUT)
+            received = network.exchange(state, timeout=EXCHANGE_TIMEOUT)
             elapsed.append(time.perf_counter() - start)
 
             expected = np.array([int(peer_id), k], dtype=np.int64)

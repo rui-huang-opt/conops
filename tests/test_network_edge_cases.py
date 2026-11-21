@@ -1,5 +1,5 @@
 """
-Boundary tests for ConOps 0.5.1 neighborwise_exchange().
+Boundary tests for ConOps neighborwise_exchange() with automatic exchange IDs.
 
 Run from the project root, after installing the Rust extension:
     python tests/test_network_edge_cases.py
@@ -32,7 +32,7 @@ def available_ports(count: int) -> list[int]:
 
 
 def test_local_validation() -> None:
-    """Bad inputs should fail before sending anything; no TCP startup required."""
+    """Invalid inputs must fail locally without requiring a TCP connection."""
     check = TestCase()
     network = Network("1", neighbors={"2": 0.5, "3": 0.5})
     state = np.array([1.0], dtype=np.float64)
@@ -45,19 +45,15 @@ def test_local_validation() -> None:
             ({**valid, "4": state}, "unexpected neighbor"),
         ):
             with check.assertRaises(ValueError, msg=label):
-                network.neighborwise_exchange(state_map, key="invalid-map")
+                network.neighborwise_exchange(state_map)
 
-        for key in (None, True, 1.5, [1, "x"], ("x", 1), (1, 2)):
-            with check.assertRaises(TypeError, msg=f"invalid key {key!r}"):
-                network.neighborwise_exchange(valid, key=key)  # type: ignore
-
-        with check.assertRaises(ValueError):
-            network.neighborwise_exchange(valid, key="k" * 300)
+        # Valid input cannot be exchanged before the network is started.
+        with check.assertRaisesRegex(RuntimeError, "Node is not started"):
+            network.neighborwise_exchange(valid)
 
         with check.assertRaises(TypeError):
             network.neighborwise_exchange(
-                {"2": np.array([object()], dtype=object), "3": state},
-                key="object-array",
+                {"2": np.array([object()], dtype=object), "3": state}
             )
     finally:
         network.close(timeout=0)
@@ -66,10 +62,7 @@ def test_local_validation() -> None:
     limited = Network("1", neighbors={"2": 0.5}, max_message_size=128)
     try:
         with check.assertRaises(ValueError):
-            limited.neighborwise_exchange(
-                {"2": np.arange(100, dtype=np.float64)},
-                key="too-large",
-            )
+            limited.neighborwise_exchange({"2": np.arange(100, dtype=np.float64)})
     finally:
         limited.close(timeout=0)
 
@@ -99,6 +92,7 @@ def make_state(sender: str, destination: str, case: int) -> np.ndarray:
 def worker(node_id: str, endpoints: dict[str, str]) -> str:
     neighbors = {other: 0.25 for other in NODE_IDS if other != node_id}
     network = Network(node_id, neighbors, peer_endpoints=endpoints)
+
     try:
         network.start()
         network.wait_connected(timeout=20)
@@ -106,8 +100,10 @@ def worker(node_id: str, endpoints: dict[str, str]) -> str:
         for case in range(6):
             state_map = {peer: make_state(node_id, peer, case) for peer in neighbors}
             received = network.neighborwise_exchange(
-                state_map, key=(case, "edge-case"), timeout=EXCHANGE_TIMEOUT
+                state_map,
+                timeout=EXCHANGE_TIMEOUT,
             )
+
             assert set(received) == set(neighbors)
             for peer, actual in received.items():
                 expected = make_state(peer, node_id, case)
@@ -115,12 +111,29 @@ def worker(node_id: str, endpoints: dict[str, str]) -> str:
                 assert actual.dtype == expected.dtype, (node_id, peer, case, "dtype")
                 np.testing.assert_array_equal(actual, expected)
 
-        with TestCase().assertRaises(RuntimeError):
-            network.neighborwise_exchange(
-                {peer: make_state(node_id, peer, 0) for peer in neighbors},
-                key=(5, "edge-case"),
-                timeout=EXCHANGE_TIMEOUT,
-            )
+        # Only node 1 makes invalid calls. These must not consume an
+        # exchange ID or invalidate the session.
+        if node_id == "1":
+            with TestCase().assertRaises(ValueError):
+                network.neighborwise_exchange({})
+
+            with TestCase().assertRaises(ValueError):
+                network.neighborwise_exchange(
+                    {peer: make_state(node_id, peer, 0) for peer in neighbors},
+                    timeout=-1,
+                )
+
+        # Every node must still use the same next internal exchange ID.
+        state_map = {peer: make_state(node_id, peer, 0) for peer in neighbors}
+        received = network.neighborwise_exchange(
+            state_map,
+            timeout=EXCHANGE_TIMEOUT,
+        )
+
+        assert set(received) == set(neighbors)
+        for peer, actual in received.items():
+            expected = make_state(peer, node_id, 0)
+            np.testing.assert_array_equal(actual, expected)
 
         return node_id
     finally:
@@ -130,8 +143,8 @@ def worker(node_id: str, endpoints: dict[str, str]) -> str:
 def test_array_roundtrips() -> None:
     ports = available_ports(len(NODE_IDS))
     endpoints = {node: f"tcp://127.0.0.1:{port}" for node, port in zip(NODE_IDS, ports)}
-    ctx = get_context("spawn")
 
+    ctx = get_context("spawn")
     with ProcessPoolExecutor(max_workers=len(NODE_IDS), mp_context=ctx) as pool:
         futures = [pool.submit(worker, node_id, endpoints) for node_id in NODE_IDS]
         results = [future.result(timeout=90) for future in futures]

@@ -40,11 +40,7 @@ def worker(node_id: str, endpoints: dict[str, str]) -> str:
                 peer_id: np.array([int(node_id), int(peer_id), k], dtype=np.float64)
                 for peer_id in neighbors
             }
-            incoming = network.neighborwise_exchange(
-                state_map,
-                key=(k, "lambda"),
-                timeout=15,
-            )
+            incoming = network.neighborwise_exchange(state_map, timeout=15)
             assert set(incoming) == set(neighbors)
             for peer_id, state in incoming.items():
                 expected = np.array([int(peer_id), int(node_id), k], dtype=np.float64)
@@ -53,7 +49,6 @@ def worker(node_id: str, endpoints: dict[str, str]) -> str:
             # The existing broadcast path still works between neighborwise calls.
             incoming = network.exchange(
                 np.array([int(node_id), k], dtype=np.int64),
-                key=(k, "broadcast"),
                 timeout=15,
             )
             for peer_id, state in incoming.items():
@@ -64,7 +59,7 @@ def worker(node_id: str, endpoints: dict[str, str]) -> str:
 
         # Incorrect neighbor maps must fail before any network message is sent.
         try:
-            network.neighborwise_exchange({}, key="invalid")
+            network.neighborwise_exchange({})
         except ValueError:
             pass
         else:
@@ -83,10 +78,7 @@ def test_neighborwise_exchange() -> None:
 
     ctx = get_context("spawn")
     with ProcessPoolExecutor(max_workers=len(NODE_IDS), mp_context=ctx) as executor:
-        futures = [
-            executor.submit(worker, node_id, endpoints)
-            for node_id in NODE_IDS
-        ]
+        futures = [executor.submit(worker, node_id, endpoints) for node_id in NODE_IDS]
         results = [future.result(timeout=90) for future in futures]
 
     assert set(results) == set(NODE_IDS)

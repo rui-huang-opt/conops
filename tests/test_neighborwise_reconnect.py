@@ -5,7 +5,7 @@ Run from the project root after installing the Rust extension:
     python tests/test_neighborwise_reconnect.py
 
 Three nodes form a chain: 1 -- 2 -- 3. A local proxy sits ONLY on the
-2 -- 3 connection. At key=(2, 'lambda'), it drops DATA in both directions,
+2 -- 3 connection. At exchange ID 2, it drops DATA in both directions,
 closes that TCP session, and forwards the later reconnect/replay traffic.
 No root access, mDNS, external services, or Rust source changes are required.
 """
@@ -16,14 +16,13 @@ import socket
 import struct
 import threading
 
-import msgspec
 import numpy as np
 
 from conops import Network
 
 NODE_IDS = ("1", "2", "3")
 NEIGHBORS = {"1": ("2",), "2": ("1", "3"), "3": ("2",)}
-CUT_KEY = (2, "lambda")
+CUT_EXCHANGE_ID = 2
 N_EXCHANGES = 6
 EXCHANGE_TIMEOUT = 25.0
 
@@ -52,11 +51,11 @@ def recv_exact(sock: socket.socket, count: int) -> bytes:
 
 
 class FaultProxy:
-    """Drop one keyed DATA frame per direction on the 2 -- 3 connection."""
+    """Drop one DATA frame per direction at a specified exchange ID."""
 
-    def __init__(self, target_port: int, cut_key: tuple[int, str]):
+    def __init__(self, target_port: int, cut_id: int):
         self.target_port = target_port
-        self.cut_key = msgspec.msgpack.encode(cut_key)
+        self.cut_key = cut_id.to_bytes(8, "big")
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.listener.bind(("127.0.0.1", 0))
@@ -99,14 +98,13 @@ class FaultProxy:
             sock.close()
 
     def _is_cut_data(self, frame: bytes) -> bool:
-        # DATA: type (u8=0) | key length (u16 BE) | encoded key | payload.
+        # DATA: type (u8=0) | key length (u16 BE) | exchange ID (u64 BE) | payload.
         # HELLO and ACK frames must be forwarded without modification.
-        if len(frame) < 3 or frame[0] != 0:
+        if len(frame) < 11 or frame[0] != 0:
             return False
+
         key_length = struct.unpack_from("!H", frame, 1)[0]
-        return (
-            len(frame) >= 3 + key_length and frame[3 : 3 + key_length] == self.cut_key
-        )
+        return key_length == 8 and frame[3:11] == self.cut_key
 
     def _accept(self) -> None:
         while not self._stop.is_set():
@@ -162,12 +160,13 @@ class FaultProxy:
                     with self._lock:
                         self._seen.add(direction)
                         print(
-                            f"[proxy] Dropped {CUT_KEY!r} DATA ({direction})",
+                            f"[proxy] Dropped exchange {CUT_EXCHANGE_ID} DATA ({direction})",
                             flush=True,
                         )
                         if len(self._seen) == 2 and not self._cut.is_set():
                             self._cut.set()
                             self._close_pair(pair)
+
                     # Keep the first direction blocked until both frames were dropped.
                     self._cut.wait(timeout=EXCHANGE_TIMEOUT)
                     return
@@ -187,9 +186,11 @@ def make_data(sender: str, destination: str, step: int) -> np.ndarray:
 
 def worker(node_id: str, endpoints: dict[str, str]) -> str:
     neighbors = {peer: 0.5 for peer in NEIGHBORS[node_id]}
+
     # Static endpoints must cover only self + this node's actual neighbors.
     local_endpoints = {peer: endpoints[peer] for peer in (node_id, *neighbors)}
     network = Network(node_id, neighbors, peer_endpoints=local_endpoints)
+
     try:
         network.start()
         network.wait_connected(timeout=20)
@@ -197,8 +198,10 @@ def worker(node_id: str, endpoints: dict[str, str]) -> str:
         for step in range(N_EXCHANGES):
             to_neighbors = {peer: make_data(node_id, peer, step) for peer in neighbors}
             received = network.neighborwise_exchange(
-                to_neighbors, key=(step, "lambda"), timeout=EXCHANGE_TIMEOUT
+                to_neighbors,
+                timeout=EXCHANGE_TIMEOUT,
             )
+
             assert set(received) == set(neighbors)
             for peer, actual in received.items():
                 np.testing.assert_array_equal(actual, make_data(peer, node_id, step))
@@ -212,7 +215,7 @@ def test_neighborwise_reconnect() -> None:
     ports = available_ports(len(NODE_IDS))
     endpoints = {node: f"tcp://127.0.0.1:{port}" for node, port in zip(NODE_IDS, ports)}
 
-    with FaultProxy(ports[2], CUT_KEY) as proxy:
+    with FaultProxy(ports[2], CUT_EXCHANGE_ID) as proxy:
         # Smaller node IDs initiate TCP connections. Node 2 initiates to 3,
         # so only its configured endpoint for node 3 goes through the proxy.
         node2_endpoints = dict(endpoints)
@@ -221,11 +224,7 @@ def test_neighborwise_reconnect() -> None:
         ctx = get_context("spawn")
         with ProcessPoolExecutor(max_workers=len(NODE_IDS), mp_context=ctx) as pool:
             futures = [
-                pool.submit(
-                    worker,
-                    node,
-                    node2_endpoints if node == "2" else endpoints,
-                )
+                pool.submit(worker, node, node2_endpoints if node == "2" else endpoints)
                 for node in NODE_IDS
             ]
             results = [future.result(timeout=90) for future in futures]

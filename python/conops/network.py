@@ -2,7 +2,6 @@ import struct
 from collections.abc import KeysView, Mapping
 from urllib.parse import urlsplit
 
-import msgspec
 import numpy as np
 from numpy.typing import NDArray
 
@@ -10,25 +9,6 @@ from ._core import CoreNetwork
 from .transform import Identity, Transform
 
 _META_LENGTH = struct.Struct("!I")
-
-ExchangeKey = int | str | tuple[int, str]
-
-
-def _encode_exchange_key(key: ExchangeKey) -> bytes:
-    """Encode a semantic key deterministically (never use Python hash())."""
-    if type(key) not in (int, str) and not (
-        type(key) is tuple
-        and len(key) == 2
-        and type(key[0]) is int
-        and type(key[1]) is str
-    ):
-        raise TypeError("key must be int, str, or tuple[int, str]")
-
-    encoded = msgspec.msgpack.encode(key)
-    if len(encoded) > 256:
-        raise ValueError("Encoded exchange key exceeds 256 bytes")
-
-    return encoded
 
 
 def _parse_tcp_endpoint(endpoint: str) -> tuple[str, int]:
@@ -100,10 +80,8 @@ class Network:
     Notes
     -----
     The cache byte limits must each be at least ``max_message_size``.
-    Every logical exchange needs a unique ``key``, used consistently by
-    neighboring nodes. Keys need not be ordered, but neighbors must execute
-    compatible sequences of exchanges. Key types: ``int``, ``str``, or
-    ``tuple[int, str]``. Encoded keys are limited to 256 bytes.
+    Exchange IDs are generated internally by Rust. Neighboring nodes must
+    perform compatible exchanges in the same logical order.
     """
 
     def __init__(
@@ -234,11 +212,11 @@ class Network:
         self,
         state: NDArray,
         *,
-        key: ExchangeKey,
         timeout: float | None = None,
         copy: bool = True,
     ) -> dict[str, NDArray]:
-        """Exchange ``state`` with all fixed neighbors using a semantic key.
+        """
+        Exchange ``state`` with all fixed neighbors.
 
         ``copy=False`` borrows the prepared NumPy payload instead of creating
         an independent Rust send snapshot. The submitted storage must not be
@@ -246,10 +224,8 @@ class Network:
         background send/replay may still access it. Exchange return or timeout
         does not signal that this storage is free to overwrite.
         """
-        encoded_key = _encode_exchange_key(key)
         meta, payload = self._prepare(state)
         incoming = self._core.exchange_array(
-            encoded_key,
             meta,
             payload,
             timeout=timeout,
@@ -261,11 +237,11 @@ class Network:
         self,
         state_map: Mapping[str, NDArray],
         *,
-        key: ExchangeKey,
         timeout: float | None = None,
         copy: bool = True,
     ) -> dict[str, NDArray]:
-        """Exchange a different state with each neighbor under the same key.
+        """
+        Exchange a different state with each neighbor.
 
         With ``copy=False``, the Rust sender borrows each prepared NumPy
         payload instead of copying it into an owned frame. The submitted
@@ -285,12 +261,10 @@ class Network:
                 f"missing={sorted(missing)}, extra={sorted(extra)}"
             )
 
-        encoded_key = _encode_exchange_key(key)
         prepared = {
             peer_id: self._prepare(state_map[peer_id]) for peer_id in self._neighbors
         }
         incoming = self._core.neighborwise_exchange_array(
-            key=encoded_key,
             states=prepared,
             timeout=timeout,
             copy=copy,
@@ -301,12 +275,11 @@ class Network:
         self,
         state: NDArray,
         *,
-        key: ExchangeKey,
         timeout: float | None = None,
         copy: bool = True,
     ) -> NDArray:
         """Compute degree * state - sum(neighbor states)."""
-        received = self.exchange(state, key=key, timeout=timeout, copy=copy)
+        received = self.exchange(state, timeout=timeout, copy=copy)
         result = len(self._neighbors) * state
         for neighbor_state in received.values():
             result -= neighbor_state
@@ -316,12 +289,11 @@ class Network:
         self,
         state: NDArray,
         *,
-        key: ExchangeKey,
         timeout: float | None = None,
         copy: bool = True,
     ) -> NDArray:
         """Compute (1 - sum(weights)) * state + sum(weight * neighbor state)."""
-        received = self.exchange(state, key=key, timeout=timeout, copy=copy)
+        received = self.exchange(state, timeout=timeout, copy=copy)
         result = (1.0 - sum(self._neighbors.values())) * state
         for peer_id, neighbor_state in received.items():
             result += self._neighbors[peer_id] * neighbor_state
