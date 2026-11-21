@@ -965,7 +965,7 @@ async fn run_network(
     config: NetworkConfig,
     mut stop_rx: oneshot::Receiver<()>,
     mut command_rx: async_mpsc::UnboundedReceiver<Command>,
-    ready_tx: mpsc::SyncSender<Result<(), String>>,
+    ready_tx: oneshot::Sender<Result<(), String>>,
 ) {
     // Bind all interfaces so discovered LAN addresses can reach the listener.
     // Use only in trusted networks; this is not an authenticated service.
@@ -1388,23 +1388,18 @@ impl CoreNetwork {
         data: ExchangeData,
         timeout: Option<f64>,
     ) -> PyResult<HashMap<String, Py<PyMemoryView>>> {
-        let deadline = match timeout {
-            Some(seconds) => {
-                if !seconds.is_finite() || seconds < 0.0 {
-                    return Err(PyValueError::new_err("timeout must be finite and >= 0"));
-                }
-                Some(
-                    Duration::try_from_secs_f64(seconds)
-                        .map_err(|_| PyValueError::new_err("timeout is too large"))?,
-                )
-            }
-            None => None,
-        };
+        let duration = timeout
+            .map(|timeout| {
+                Duration::try_from_secs_f64(timeout).map_err(|_| {
+                    PyValueError::new_err("timeout must be finite, nonnegative, and representable")
+                })
+            })
+            .transpose()?;
         let commands = self
             .commands
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Node is not started"))?;
-        let end = deadline
+        let deadline = duration
             .map(|duration| {
                 Instant::now()
                     .checked_add(duration)
@@ -1422,8 +1417,8 @@ impl CoreNetwork {
 
         // Periodically check Python signals so Ctrl+C can interrupt exchange().
         let result = loop {
-            let wait = match end {
-                Some(end) => end
+            let wait = match deadline {
+                Some(deadline) => deadline
                     .saturating_duration_since(Instant::now())
                     .min(Duration::from_millis(100)),
                 None => Duration::from_millis(100),
@@ -1445,7 +1440,7 @@ impl CoreNetwork {
                         return Err(err);
                     }
 
-                    if end.is_some_and(|end| Instant::now() >= end) {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                         break Err(mpsc::RecvTimeoutError::Timeout);
                     }
                 }
@@ -1520,7 +1515,7 @@ impl CoreNetwork {
             })
             .transpose()?;
 
-        if let Some(ref endpoints) = peer_endpoints {
+        if let Some(endpoints) = peer_endpoints.as_ref() {
             let expected = neighbors.as_ref().ok_or_else(|| {
                 PyValueError::new_err("peer_endpoints requires configured neighbors")
             })?;
@@ -1559,7 +1554,7 @@ impl CoreNetwork {
             return Err(PyRuntimeError::new_err("Node already started"));
         }
         let (stop_tx, stop_rx) = oneshot::channel();
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = oneshot::channel();
         let (command_tx, command_rx) = async_mpsc::unbounded_channel();
 
         let node_id = self.node_id.clone();
@@ -1590,7 +1585,7 @@ impl CoreNetwork {
             }
         });
 
-        match py.detach(move || ready_rx.recv()) {
+        match py.detach(move || ready_rx.blocking_recv()) {
             Ok(Ok(())) => {
                 self.commands = Some(command_tx);
                 self.stop_tx = Some(stop_tx);
@@ -2145,8 +2140,8 @@ mod optimization_tests {
         let (cmd_b, recv_b) = async_mpsc::unbounded_channel();
         let (stop_a, stopped_a) = oneshot::channel();
         let (stop_b, stopped_b) = oneshot::channel();
-        let (ready_a, started_a) = mpsc::sync_channel(1);
-        let (ready_b, started_b) = mpsc::sync_channel(1);
+        let (ready_a, started_a) = oneshot::channel();
+        let (ready_b, started_b) = oneshot::channel();
         let a = tokio::spawn(run_network(
             "A".into(),
             port_a,
@@ -2169,8 +2164,17 @@ mod optimization_tests {
             recv_b,
             ready_b,
         ));
-        reply_value(started_a).await.unwrap();
-        reply_value(started_b).await.unwrap();
+        timeout(Duration::from_secs(10), started_a)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        timeout(Duration::from_secs(10), started_b)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         timeout(Duration::from_secs(10), async {
             loop {
                 let (reply, rx) = mpsc::channel();
@@ -2251,7 +2255,7 @@ mod optimization_tests {
         };
         let (commands, command_rx) = async_mpsc::unbounded_channel();
         let (stop, stop_rx) = oneshot::channel();
-        let (ready, ready_rx) = mpsc::sync_channel(1);
+        let (ready, ready_rx) = oneshot::channel();
         let worker = tokio::spawn(run_network(
             "A".into(),
             0,
@@ -2263,7 +2267,11 @@ mod optimization_tests {
             command_rx,
             ready,
         ));
-        reply_value(ready_rx).await.unwrap();
+        timeout(Duration::from_secs(10), ready_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         let (stream, _) = timeout(Duration::from_secs(10), listener.accept())
             .await
             .unwrap()
