@@ -15,6 +15,7 @@
 
 # Development
 .vscode/
+/benchmark/logs/
 
 # Network captures
 *.pcap

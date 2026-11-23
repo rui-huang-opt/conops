@@ -11,6 +11,7 @@ import time
 from statistics import median
 
 import numpy.random as npr
+import zmq
 
 from conops import Graph, LiteNetwork, Network
 
@@ -28,7 +29,68 @@ EDGES = [
 ]
 
 
+class LanBarrier:
+    def __init__(
+        self,
+        node_id: str,
+        host: str,
+        port: int = 47000,
+        parties: int = 6,
+        timeout: float = 120.0,
+    ):
+        self.leader = node_id == "1"
+        self.parties = parties
+        self.round = 0
+
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.ROUTER if self.leader else zmq.REQ)
+
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.setsockopt(zmq.RCVTIMEO, int(timeout * 1000))
+        self.socket.setsockopt(zmq.SNDTIMEO, int(timeout * 1000))
+
+        if self.leader:
+            self.socket.bind(f"tcp://0.0.0.0:{port}")
+        else:
+            self.socket.setsockopt(zmq.IDENTITY, node_id.encode())
+            self.socket.connect(f"tcp://{host}:{port}")
+
+    def wait(self) -> None:
+        token = self.round.to_bytes(8, "big")
+
+        if self.leader:
+            peers = []
+            seen = set()
+
+            for _ in range(self.parties - 1):
+                identity, delimiter, message = self.socket.recv_multipart()
+
+                if delimiter != b"" or message != token:
+                    raise RuntimeError("Barrier round mismatch")
+                if identity in seen:
+                    raise RuntimeError("Duplicate barrier participant")
+
+                seen.add(identity)
+                peers.append(identity)
+
+            for identity in peers:
+                self.socket.send_multipart([identity, b"", token])
+
+        else:
+            self.socket.send(token)
+
+            if self.socket.recv() != token:
+                raise RuntimeError("Barrier round mismatch")
+
+        self.round += 1
+
+    def close(self) -> None:
+        self.socket.close(0)
+        self.context.term()
+
+
 def measure_rust(
+    barrier: LanBarrier,
     network: Network,
     node_id: str,
     n_state: int,
@@ -43,14 +105,22 @@ def measure_rust(
     for k in range(n_warmup):
         network.exchange(x, copy=copy)
 
+    barrier.wait()
+
     before = time.perf_counter()
     for k in range(n_iter - 1):
         x = x - 0.25 * network.laplacian(x, copy=copy)
         y = y - 0.20 * network.laplacian(y, copy=copy)
-    return time.perf_counter() - before
+
+    elapsed = time.perf_counter() - before
+
+    barrier.wait()
+
+    return elapsed
 
 
 def measure_lite(
+    barrier: LanBarrier,
     network: LiteNetwork,
     node_id: str,
     n_state: int,
@@ -64,11 +134,18 @@ def measure_lite(
     for k in range(n_warmup):
         network.exchange(x)
 
+    barrier.wait()
+
     before = time.perf_counter()
     for k in range(n_iter - 1):
         x = x - 0.25 * network.laplacian(x)
         y = y - 0.20 * network.laplacian(y)
-    return time.perf_counter() - before
+
+    elapsed = time.perf_counter() - before
+
+    barrier.wait()
+
+    return elapsed
 
 
 def main() -> None:
@@ -87,6 +164,8 @@ def main() -> None:
         default=True,
         help="Rust only: use a send snapshot; --no-copy borrows the NumPy payload.",
     )
+    parser.add_argument("--barrier-host", required=True)
+    parser.add_argument("--barrier-port", type=int, default=47000)
     args = parser.parse_args()
 
     if args.n_state < 1 or args.n_iter < 2 or args.n_warmup < 0 or args.repeats < 1:
@@ -97,6 +176,13 @@ def main() -> None:
     rust: Network | None = None
     lite: LiteNetwork | None = None
     rust_started = False
+
+    barrier = LanBarrier(
+        node_id=args.node_id,
+        host=args.barrier_host,
+        port=args.barrier_port,
+        parties=len(NODES),
+    )
 
     print(
         f"Node {args.node_id} | six-node graph | neighbors={list(neighbors)} | "
@@ -126,6 +212,7 @@ def main() -> None:
         for repeat in range(args.repeats):
             if repeat % 2 == 0:
                 rust_elapsed = measure_rust(
+                    barrier=barrier,
                     network=rust,
                     node_id=args.node_id,
                     n_state=args.n_state,
@@ -141,6 +228,7 @@ def main() -> None:
                 )
 
                 lite_elapsed = measure_lite(
+                    barrier=barrier,
                     network=lite,
                     node_id=args.node_id,
                     n_state=args.n_state,
@@ -155,6 +243,7 @@ def main() -> None:
                 )
             else:
                 lite_elapsed = measure_lite(
+                    barrier=barrier,
                     network=lite,
                     node_id=args.node_id,
                     n_state=args.n_state,
@@ -169,6 +258,7 @@ def main() -> None:
                 )
 
                 rust_elapsed = measure_rust(
+                    barrier=barrier,
                     network=rust,
                     node_id=args.node_id,
                     n_state=args.n_state,
@@ -187,8 +277,12 @@ def main() -> None:
             if lite is not None:
                 lite.close(timeout=10.0)
         finally:
-            if rust is not None:
-                rust.close(timeout=10.0 if rust_started else 0.0)
+            try:
+                if rust is not None:
+                    rust.close(timeout=10.0 if rust_started else 0.0)
+            finally:
+                if barrier is not None:
+                    barrier.close()
 
     print(f"\nNode {args.node_id} summary (median of local elapsed times)")
     for kind, times in results.items():
