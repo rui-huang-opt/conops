@@ -1,6 +1,6 @@
 [package]
 name = "conops-core"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 
 [lib]
@@ -15,3 +15,6 @@ mdns-sd = "0.21"
 numpy = "0.29"
 log = "0.4"
 pyo3-log = "0.13"
+
+[profile.release]
+lto = "thin"
