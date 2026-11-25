@@ -1,18 +1,15 @@
 """
-Benchmark ConOps on two LAN machines, coordinated by Ray Core.
+Benchmark ConOps communication performance across two LAN machines.
 
-NUC (192.168.1.101): nodes 1, 2, 3
-Laptop (192.168.1.111): nodes 4, 5, 6
+This benchmark compares Network (Rust) and LiteNetwork (ZeroMQ).
 
-Start the Ray head and worker separately, then run ONLY on the NUC:
+Ray is required for distributed process management. To run the benchmark,
+install Ray on both machines and configure a Ray cluster before execution.
+
+Run on the head node:
 
     python benchmark/ray_lan_benchmark.py
     python benchmark/ray_lan_benchmark.py --static
-
-Six persistent Ray actors own the ConOps connections. The Ray driver controls
-warmup, measurement, and result aggregation. There is no barrier service:
-all six actors finish warmup before the driver submits their timed runs.
-Ray is never called inside the timed loop.
 """
 
 import os
