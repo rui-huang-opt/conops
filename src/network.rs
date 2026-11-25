@@ -268,6 +268,11 @@ impl ExchangeData {
     }
 }
 
+struct PeerAddress {
+    addresses: Vec<String>,
+    fullname: Option<String>,
+}
+
 struct Established {
     peer_id: String,
     stream: TcpStream,
@@ -1015,10 +1020,18 @@ async fn run_network(
     let mut connected_before = HashSet::<PeerIndex>::new();
     // Static endpoints are known from startup, so the existing retry and replay paths work without mDNS.
     // Only the smaller node ID initiates connections.
-    let mut addresses: HashMap<String, Vec<String>> = peer_endpoints
+    let mut addresses: HashMap<String, PeerAddress> = peer_endpoints
         .unwrap_or_default()
         .into_iter()
-        .map(|(peer_id, address)| (peer_id, vec![address]))
+        .map(|(peer_id, address)| {
+            (
+                peer_id,
+                PeerAddress {
+                    addresses: vec![address],
+                    fullname: None,
+                },
+            )
+        })
         .collect();
     let mut retry = interval(CONNECT_RETRY_INTERVAL);
     retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1089,7 +1102,10 @@ async fn run_network(
                         } else if peers.contains_id(&peer_id) || !connecting.insert(peer_id.clone()) {
                             let _ = reply.send(Err(format!("Already connected or connecting to {peer_id}")));
                         } else {
-                            addresses.insert(peer_id.clone(), vec![address.clone()]);
+                            addresses.insert(peer_id.clone(), PeerAddress {
+                                addresses: vec![address.clone()],
+                                fullname: None,
+                            });
                             start_connect(&node_id, peer_id, vec![address], established_tx.clone(), Some(reply));
                         }
                     }
@@ -1256,7 +1272,10 @@ async fn run_network(
                             let candidates = peer.addresses.into_iter()
                                 .map(|addr| addr.to_string())
                                 .collect::<Vec<_>>();
-                            addresses.insert(peer_id.clone(), candidates.clone());
+                            addresses.insert(peer_id.clone(), PeerAddress {
+                                addresses: candidates.clone(),
+                                fullname: Some(peer.fullname),
+                            });
                             if node_id.as_str() < peer_id.as_str()
                                 && !peers.contains_id(&peer_id)
                                 && connecting.insert(peer_id.clone())
@@ -1265,10 +1284,14 @@ async fn run_network(
                             }
                         }
                     }
-                    Some(DiscoveryEvent::Removed(peer_id)) => {
-                        // mDNS removal is not proof of TCP failure.
-                        // Keep any established connection, but stop using this address for retries.
-                        addresses.remove(&peer_id);
+                    Some(DiscoveryEvent::Removed { node_id, fullname }) => {
+                        // An old service removal must not erase a newly discovered address.
+                        // Keep any established TCP connection even when its service disappears.
+                        if addresses.get(&node_id)
+                            .is_some_and(|entry| entry.fullname.as_deref() == Some(fullname.as_str()))
+                        {
+                            addresses.remove(&node_id);
+                        }
                     }
                     None => {
                         warn!("[{node_id}] mDNS discovery stopped");
@@ -1280,13 +1303,13 @@ async fn run_network(
             // If a service was discovered before its TCP listener was ready,
             // retry connection without waiting for another mDNS notification.
             _ = retry.tick(), if !addresses.is_empty() => {
-                for (peer_id, candidates) in &addresses {
+                for (peer_id, entry) in &addresses {
                     if node_id.as_str() < peer_id.as_str()
                         && !peers.contains_id(peer_id)
                         && connecting.insert(peer_id.clone())
                     {
                         start_connect(
-                            &node_id, peer_id.clone(), candidates.clone(),
+                            &node_id, peer_id.clone(), entry.addresses.clone(),
                             established_tx.clone(), None,
                         );
                     }

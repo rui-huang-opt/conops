@@ -12,29 +12,24 @@ _META_LENGTH = struct.Struct("!I")
 
 
 def _parse_tcp_endpoint(endpoint: str) -> tuple[str, int]:
-    """Return a TCP host:port address suitable for Tokio, plus its port."""
     try:
         parsed = urlsplit(endpoint)
-        host = parsed.hostname
-        port = parsed.port
+        host, port = parsed.hostname, parsed.port
+
+        if (
+            parsed.scheme != "tcp"
+            or not host
+            or ":" in host  # No IPv6
+            or not port
+            or parsed.username is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError
     except (ValueError, TypeError) as exc:
         raise ValueError(f"Invalid TCP endpoint: {endpoint!r}") from exc
 
-    if (
-        parsed.scheme != "tcp"
-        or not host
-        or port is None
-        or port == 0
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ValueError(f"Invalid TCP endpoint: {endpoint!r}")
-
-    if ":" in host:  # IPv6 literal; preserve brackets for Tokio's address parser.
-        host = f"[{host}]"
     return f"{host}:{port}", port
 
 
@@ -181,17 +176,6 @@ class Network:
 
     def _prepare(self, state: NDArray) -> tuple[bytes, NDArray[np.uint8]]:
         meta, payload = self._transform.encode(state)
-        if not isinstance(meta, bytes):
-            raise TypeError("Transform.encode() must return metadata as bytes")
-        if not isinstance(payload, np.ndarray):
-            raise TypeError("Transform.encode() must return a NumPy array as payload")
-        if payload.dtype.hasobject:
-            raise TypeError("Cannot send NumPy arrays containing Python objects")
-        if len(meta) > 0xFFFFFFFF:
-            raise ValueError("Transform metadata is too large")
-
-        # No Python bytes allocation: only make a copy when the input is strided.
-        # Flatten first, so scalar and multidimensional arrays work too.
         contiguous = np.ascontiguousarray(payload)
         return meta, contiguous.reshape(-1).view(np.uint8)
 
@@ -281,8 +265,8 @@ class Network:
         """Compute degree * state - sum(neighbor states)."""
         received = self.exchange(state, timeout=timeout, copy=copy)
         result = len(self._neighbors) * state
-        for neighbor_state in received.values():
-            result -= neighbor_state
+        for peer_id in self._neighbors:
+            result -= received[peer_id]
         return result
 
     def weighted_mix(
@@ -295,6 +279,6 @@ class Network:
         """Compute (1 - sum(weights)) * state + sum(weight * neighbor state)."""
         received = self.exchange(state, timeout=timeout, copy=copy)
         result = (1.0 - sum(self._neighbors.values())) * state
-        for peer_id, neighbor_state in received.items():
-            result += self._neighbors[peer_id] * neighbor_state
+        for peer_id, weight in self._neighbors.items():
+            result += weight * received[peer_id]
         return result

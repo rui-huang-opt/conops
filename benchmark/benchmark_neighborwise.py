@@ -241,7 +241,7 @@ def main() -> None:
     )
     parser.add_argument("--n_iter", type=int, default=100)
     parser.add_argument("--n_state", type=int, default=1_000_000)
-    parser.add_argument("--n_warmup", type=int, default=10)
+    parser.add_argument("--n_warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--group_id", default=None)
     parser.add_argument(

@@ -12,13 +12,14 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 pub struct DiscoveredPeer {
     pub node_id: String,
+    pub fullname: String,
     pub addresses: Vec<SocketAddr>,
 }
 
 #[derive(Debug)]
 pub enum DiscoveryEvent {
     Found(DiscoveredPeer),
-    Removed(String),
+    Removed { node_id: String, fullname: String },
 }
 
 pub struct Discovery {
@@ -37,11 +38,24 @@ impl Discovery {
 
         let hostname = format!("conops-{}-{port}.local.", std::process::id());
 
+        // Distinguish successive service instances even when node_id is reused.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let instance_name = format!("conops-{}-{port}-{nonce:x}", std::process::id());
+
         let properties = [("node_id", node_id), ("group", group_id)];
 
-        let service =
-            ServiceInfo::new(SERVICE_TYPE, node_id, &hostname, "", port, &properties[..])?
-                .enable_addr_auto();
+        let service = ServiceInfo::new(
+            SERVICE_TYPE,
+            &instance_name,
+            &hostname,
+            "",
+            port,
+            &properties[..],
+        )?
+        .enable_addr_auto();
 
         let fullname = service.get_fullname().to_owned();
 
@@ -89,18 +103,19 @@ impl Discovery {
                         continue;
                     }
 
-                    self.known
-                        .insert(info.get_fullname().to_owned(), peer_id.to_owned());
+                    let fullname = info.get_fullname().to_owned();
+                    self.known.insert(fullname.clone(), peer_id.to_owned());
 
                     return Some(DiscoveryEvent::Found(DiscoveredPeer {
                         node_id: peer_id.to_owned(),
+                        fullname,
                         addresses,
                     }));
                 }
 
                 ServiceEvent::ServiceRemoved(_, fullname) => {
                     if let Some(node_id) = self.known.remove(&fullname) {
-                        return Some(DiscoveryEvent::Removed(node_id));
+                        return Some(DiscoveryEvent::Removed { node_id, fullname });
                     }
                 }
 
