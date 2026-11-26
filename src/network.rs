@@ -992,13 +992,13 @@ async fn run_network(
             return;
         }
     };
-    // Use mDNS only for fixed-topology networks without static endpoints.
+    // Use UDP scouting only for fixed-topology networks without static endpoints.
     // Explicit peer endpoints keep the fixed topology but skip multicast discovery.
     let mut discovery = if neighbors.is_some() && peer_endpoints.is_none() {
         match Discovery::new(&node_id, actual_port, &group_id) {
             Ok(discovery) => Some(discovery),
             Err(err) => {
-                let _ = ready_tx.send(Err(format!("Cannot start mDNS: {err}")));
+                let _ = ready_tx.send(Err(format!("Cannot start UDP scouting: {err}")));
                 return;
             }
         }
@@ -1294,14 +1294,13 @@ async fn run_network(
                         }
                     }
                     None => {
-                        warn!("[{node_id}] mDNS discovery stopped");
+                        warn!("[{node_id}] UDP scouting stopped");
                         discovery = None; // avoid a busy loop on a closed receiver
                     }
                 }
             }
 
-            // If a service was discovered before its TCP listener was ready,
-            // retry connection without waiting for another mDNS notification.
+            // Retry disconnected peers using their last discovered TCP addresses.
             _ = retry.tick(), if !addresses.is_empty() => {
                 for (peer_id, entry) in &addresses {
                     if node_id.as_str() < peer_id.as_str()
@@ -1382,11 +1381,7 @@ async fn run_network(
         peer.reader.abort();
         peer.writer.abort();
     }
-    if let Some(discovery) = discovery {
-        if let Err(err) = discovery.close() {
-            warn!("[{node_id}] Failed to stop mDNS: {err}");
-        }
-    }
+    drop(discovery);
     info!("[{node_id}] Stopped");
 }
 
