@@ -284,6 +284,7 @@ mod tests {
     #[ignore = "requires local UDP multicast support"]
     async fn test_discovery() {
         let pid = std::process::id();
+
         let a_id = format!("test-a-{pid}");
         let b_id = format!("test-b-{pid}");
         let namespace = format!("test-namespace-{pid}");
@@ -291,35 +292,42 @@ mod tests {
         let mut a = Discovery::new(&a_id, 5000, &namespace).unwrap();
         let mut b = Discovery::new(&b_id, 5001, &namespace).unwrap();
 
-        let (found_b, found_a) = tokio::join!(
-            timeout(Duration::from_secs(15), async {
-                loop {
-                    match a.next().await {
-                        Some(DiscoveryEvent::Found(peer)) if peer.node_id == b_id => break peer,
-                        Some(_) => continue,
-                        None => panic!("Discovery A stopped unexpectedly"),
-                    }
-                }
-            }),
-            timeout(Duration::from_secs(15), async {
-                loop {
-                    match b.next().await {
-                        Some(DiscoveryEvent::Found(peer)) if peer.node_id == a_id => break peer,
-                        Some(_) => continue,
-                        None => panic!("Discovery B stopped unexpectedly"),
-                    }
-                }
-            }),
-        );
+        let (found_b, found_a) = timeout(Duration::from_secs(15), async {
+            let mut found_b = None;
+            let mut found_a = None;
 
-        assert_eq!(
-            found_b.expect("A did not discover B").addresses[0].port(),
-            5001
-        );
-        assert_eq!(
-            found_a.expect("B did not discover A").addresses[0].port(),
-            5000
-        );
+            while found_b.is_none() || found_a.is_none() {
+                tokio::select! {
+                    event = a.next() => {
+                        match event {
+                            Some(DiscoveryEvent::Found(peer)) if peer.node_id == b_id => {
+                                found_b = Some(peer);
+                            }
+                            Some(_) => {}
+                            None => panic!("Discovery A stopped unexpectedly"),
+                        }
+                    }
+
+                    event = b.next() => {
+                        match event {
+                            Some(DiscoveryEvent::Found(peer)) if peer.node_id == a_id => {
+                                found_a = Some(peer);
+                            }
+                            Some(_) => {}
+                            None => panic!("Discovery B stopped unexpectedly"),
+                        }
+                    }
+                }
+            }
+
+            (found_b.unwrap(), found_a.unwrap())
+        })
+        .await
+        .expect("Bidirectional discovery timed out");
+
+        assert_eq!(found_b.addresses[0].port(), 5001);
+        assert_eq!(found_a.addresses[0].port(), 5000);
+
         a.close().unwrap();
         b.close().unwrap();
     }
