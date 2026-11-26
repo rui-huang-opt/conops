@@ -24,21 +24,7 @@ const HEADER_LEN: usize = 18;
 #[derive(Debug)]
 pub struct DiscoveredPeer {
     pub node_id: String,
-    // Kept for compatibility with network.rs: identifies a specific process start.
-    pub fullname: String,
     pub addresses: Vec<SocketAddr>,
-}
-
-#[derive(Debug)]
-pub enum DiscoveryEvent {
-    Found(DiscoveredPeer),
-    // Kept temporarily so network.rs compiles unchanged. UDP discovery does not
-    // emit Removed: TCP disconnections are handled by the network layer.
-    #[allow(dead_code)]
-    Removed {
-        node_id: String,
-        fullname: String,
-    },
 }
 
 struct Message<'a> {
@@ -179,7 +165,7 @@ impl Discovery {
     }
 
     /// Wait for a previously unknown or changed peer address.
-    pub async fn next(&mut self) -> Option<DiscoveryEvent> {
+    pub async fn next(&mut self) -> Option<DiscoveredPeer> {
         let mut multicast_buf = [0u8; 1024];
         let mut unicast_buf = [0u8; 1024];
         let multicast_addr = SocketAddr::V4(SocketAddrV4::new(MULTICAST_IP, MULTICAST_PORT));
@@ -239,19 +225,13 @@ impl Discovery {
                     }
                     self.known.insert(message.node_id.to_owned(), identity);
 
-                    return Some(DiscoveryEvent::Found(DiscoveredPeer {
+                    return Some(DiscoveredPeer {
                         node_id: message.node_id.to_owned(),
-                        fullname: format!("{}:{:016x}", message.node_id, message.instance_id),
                         addresses: vec![endpoint],
-                    }));
+                    });
                 }
             }
         }
-    }
-
-    /// Drop both sockets; no daemon or background thread needs shutting down.
-    pub fn close(self) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -300,7 +280,7 @@ mod tests {
                 tokio::select! {
                     event = a.next() => {
                         match event {
-                            Some(DiscoveryEvent::Found(peer)) if peer.node_id == b_id => {
+                            Some(peer) if peer.node_id == b_id => {
                                 found_b = Some(peer);
                             }
                             Some(_) => {}
@@ -310,7 +290,7 @@ mod tests {
 
                     event = b.next() => {
                         match event {
-                            Some(DiscoveryEvent::Found(peer)) if peer.node_id == a_id => {
+                            Some(peer) if peer.node_id == a_id => {
                                 found_a = Some(peer);
                             }
                             Some(_) => {}
@@ -327,8 +307,5 @@ mod tests {
 
         assert_eq!(found_b.addresses[0].port(), 5001);
         assert_eq!(found_a.addresses[0].port(), 5000);
-
-        a.close().unwrap();
-        b.close().unwrap();
     }
 }

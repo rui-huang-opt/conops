@@ -27,7 +27,7 @@ use tokio::{
     time::{MissedTickBehavior, interval, timeout},
 };
 
-use crate::discovery::{Discovery, DiscoveryEvent};
+use crate::discovery::Discovery;
 use crate::exchange::{Batch, CompletedKeys, EarlyMessages, PeerIndex, PeerLayout};
 use crate::message;
 use crate::tcp::{FrameReader, recv_message, send_message, send_message_parts};
@@ -268,11 +268,6 @@ impl ExchangeData {
     }
 }
 
-struct PeerAddress {
-    addresses: Vec<String>,
-    fullname: Option<String>,
-}
-
 struct Established {
     peer_id: String,
     stream: TcpStream,
@@ -291,7 +286,7 @@ enum ConnectEvent {
     },
 }
 
-// Connection setup is shared by explicit connect() and mDNS auto-connect.
+// Connection setup is shared by explicit and discovered connections.
 fn start_connect(
     my_id: &str,
     peer_id: String,
@@ -1018,20 +1013,12 @@ async fn run_network(
     let mut next_session = 0u64;
     let mut connecting = HashSet::<String>::new();
     let mut connected_before = HashSet::<PeerIndex>::new();
-    // Static endpoints are known from startup, so the existing retry and replay paths work without mDNS.
+    // Static endpoints use the same retry and replay mechanisms.
     // Only the smaller node ID initiates connections.
-    let mut addresses: HashMap<String, PeerAddress> = peer_endpoints
+    let mut addresses: HashMap<String, Vec<String>> = peer_endpoints
         .unwrap_or_default()
         .into_iter()
-        .map(|(peer_id, address)| {
-            (
-                peer_id,
-                PeerAddress {
-                    addresses: vec![address],
-                    fullname: None,
-                },
-            )
-        })
+        .map(|(peer_id, address)| (peer_id, vec![address]))
         .collect();
     let mut retry = interval(CONNECT_RETRY_INTERVAL);
     retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1102,10 +1089,7 @@ async fn run_network(
                         } else if peers.contains_id(&peer_id) || !connecting.insert(peer_id.clone()) {
                             let _ = reply.send(Err(format!("Already connected or connecting to {peer_id}")));
                         } else {
-                            addresses.insert(peer_id.clone(), PeerAddress {
-                                addresses: vec![address.clone()],
-                                fullname: None,
-                            });
+                            addresses.insert(peer_id.clone(), vec![address.clone()]);
                             start_connect(&node_id, peer_id, vec![address], established_tx.clone(), Some(reply));
                         }
                     }
@@ -1258,58 +1242,60 @@ async fn run_network(
                 }
             }
 
-            // mDNS only tells us where a node is; it never changes our topology.
-            discovered_event = async {
+            // Discovery provides peer addresses without changing the topology.
+            discovered_peer = async {
                 match discovery.as_mut() {
                     Some(discovery) => discovery.next().await,
-                    None => future::pending::<Option<DiscoveryEvent>>().await,
+                    None => future::pending().await,
                 }
             } => {
-                match discovered_event {
-                    Some(DiscoveryEvent::Found(peer)) => {
+                match discovered_peer {
+                    Some(peer) => {
                         let peer_id = peer.node_id;
+
                         if neighbors.as_ref().is_some_and(|ids| ids.contains(&peer_id)) {
-                            let candidates = peer.addresses.into_iter()
+                            let candidates = peer.addresses
+                                .into_iter()
                                 .map(|addr| addr.to_string())
                                 .collect::<Vec<_>>();
-                            addresses.insert(peer_id.clone(), PeerAddress {
-                                addresses: candidates.clone(),
-                                fullname: Some(peer.fullname),
-                            });
+
+                            addresses.insert(peer_id.clone(), candidates.clone());
+
                             if node_id.as_str() < peer_id.as_str()
                                 && !peers.contains_id(&peer_id)
                                 && connecting.insert(peer_id.clone())
                             {
-                                start_connect(&node_id, peer_id, candidates, established_tx.clone(), None);
+                                start_connect(
+                                    &node_id,
+                                    peer_id,
+                                    candidates,
+                                    established_tx.clone(),
+                                    None,
+                                );
                             }
                         }
                     }
-                    Some(DiscoveryEvent::Removed { node_id, fullname }) => {
-                        // An old service removal must not erase a newly discovered address.
-                        // Keep any established TCP connection even when its service disappears.
-                        if addresses.get(&node_id)
-                            .is_some_and(|entry| entry.fullname.as_deref() == Some(fullname.as_str()))
-                        {
-                            addresses.remove(&node_id);
-                        }
-                    }
+
                     None => {
                         warn!("[{node_id}] UDP scouting stopped");
-                        discovery = None; // avoid a busy loop on a closed receiver
+                        discovery = None;
                     }
                 }
             }
 
             // Retry disconnected peers using their last discovered TCP addresses.
             _ = retry.tick(), if !addresses.is_empty() => {
-                for (peer_id, entry) in &addresses {
+                for (peer_id, candidates) in &addresses {
                     if node_id.as_str() < peer_id.as_str()
                         && !peers.contains_id(peer_id)
                         && connecting.insert(peer_id.clone())
                     {
                         start_connect(
-                            &node_id, peer_id.clone(), entry.addresses.clone(),
-                            established_tx.clone(), None,
+                            &node_id,
+                            peer_id.clone(),
+                            candidates.clone(),
+                            established_tx.clone(),
+                            None,
                         );
                     }
                 }
@@ -1381,7 +1367,7 @@ async fn run_network(
         peer.reader.abort();
         peer.writer.abort();
     }
-    drop(discovery);
+
     info!("[{node_id}] Stopped");
 }
 
