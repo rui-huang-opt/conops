@@ -185,7 +185,11 @@ def main() -> None:
     parser.add_argument("--n-warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--copy", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--static", action="store_true", help="Disable Rust mDNS")
+    parser.add_argument(
+        "--static",
+        action="store_true",
+        help="Disable Rust UDP scouting",
+    )
     parser.add_argument("--timeout", type=float, default=600.0)
     args = parser.parse_args()
 
