@@ -1,3 +1,4 @@
+import secrets
 from typing import Protocol
 
 import msgspec
@@ -474,6 +475,85 @@ class SignQuantize:
 
         quantized_state = np.frombuffer(payload, dtype=np.int8).reshape(meta.shape)
 
+        return (quantized_state * meta.scale).astype(source_dtype, copy=False)
+
+
+class DPQuantize:
+    """
+    One-bit randomized quantization with local differential privacy.
+
+    Each element is clipped to [-bound, bound] and randomized to -1 or +1.
+    This is equivalent to stochastic sign quantization followed by binary
+    randomized response.
+    For a fixed-shape array of d elements, this mechanism allocates epsilon/d
+    to each element, providing epsilon-local differential privacy for one
+    complete array release (assuming the shape and dtype are public).
+
+    For a clipped value x, let alpha = tanh(epsilon / (2 * d)). Then
+
+        P(q = +1 | x) = (1 + alpha * x / bound) / 2.
+
+    Decoding returns q * bound / alpha, an unbiased estimate of the clipped
+    value. This estimate can be very noisy, particularly for large arrays or
+    small epsilon. Each quantized sign uses one int8 byte (not bit-packed).
+
+    Randomness is generated with a cryptographically secure source; no random
+    seed is transmitted. Repeated releases consume additional privacy budget.
+
+    Parameters
+    ----------
+    epsilon : float
+        Positive privacy budget for an entire array per encode call.
+
+    bound : float
+        Positive, public absolute clipping bound for every array element.
+        It must not be estimated from the private state being transmitted.
+    """
+
+    def __init__(self, epsilon: float, bound: float) -> None:
+        # A finite, positive epsilon is required for a valid privacy budget.
+        if not np.isfinite(epsilon) or epsilon <= 0:
+            raise ValueError("epsilon must be finite and positive")
+
+        # A finite, positive bound ensures valid clipping and randomization probabilities.
+        if not np.isfinite(bound) or bound <= 0:
+            raise ValueError("bound must be finite and positive")
+
+        self.epsilon = float(epsilon)
+        self.bound = float(bound)
+
+    def encode(self, state: NDArray) -> tuple[bytes, NDArray]:
+        # NaN or infinity can produce invalid probabilities and violate the LDP guarantee.
+        if not np.all(np.isfinite(state)):
+            raise ValueError("state must contain only finite values")
+
+        alpha = min(float(np.tanh(self.epsilon / (2 * state.size))), 1.0 - 1e-12)
+        scale = self.bound / alpha
+
+        clipped = np.clip(
+            state.astype(np.float64, copy=False),
+            -self.bound,
+            self.bound,
+        )
+        probabilities = 0.5 * (1.0 + alpha * clipped / self.bound)
+
+        # Secure independent uniforms; the seed is never shared with peers.
+        raw = np.frombuffer(secrets.token_bytes(8 * state.size), dtype=np.uint64)
+        uniforms = (raw >> 11) * (1.0 / (1 << 53))
+        quantized_state = np.where(
+            uniforms.reshape(state.shape) < probabilities,
+            1,
+            -1,
+        ).astype(np.int8)
+
+        meta = SignMeta(source_dtype=state.dtype.str, shape=state.shape, scale=scale)
+        meta_bytes = msgspec.msgpack.encode(meta)
+        return meta_bytes, quantized_state
+
+    def decode(self, meta_bytes: bytes, payload: bytes | memoryview) -> NDArray:
+        meta = msgspec.msgpack.decode(meta_bytes, type=SignMeta)
+        source_dtype = np.dtype(meta.source_dtype)
+        quantized_state = np.frombuffer(payload, dtype=np.int8).reshape(meta.shape)
         return (quantized_state * meta.scale).astype(source_dtype, copy=False)
 
 

@@ -1,7 +1,9 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_int, c_void},
-    future, io, ptr,
+    future, io,
+    net::Ipv4Addr,
+    ptr,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
@@ -27,7 +29,7 @@ use tokio::{
     time::{MissedTickBehavior, interval, timeout},
 };
 
-use crate::discovery::{Discovery, DiscoveryEvent};
+use crate::discovery::Discovery;
 use crate::exchange::{Batch, CompletedKeys, EarlyMessages, PeerIndex, PeerLayout};
 use crate::message;
 use crate::tcp::{FrameReader, recv_message, send_message, send_message_parts};
@@ -268,11 +270,6 @@ impl ExchangeData {
     }
 }
 
-struct PeerAddress {
-    addresses: Vec<String>,
-    fullname: Option<String>,
-}
-
 struct Established {
     peer_id: String,
     stream: TcpStream,
@@ -291,7 +288,7 @@ enum ConnectEvent {
     },
 }
 
-// Connection setup is shared by explicit connect() and mDNS auto-connect.
+// Connection setup is shared by explicit and discovered connections.
 fn start_connect(
     my_id: &str,
     peer_id: String,
@@ -968,6 +965,7 @@ async fn run_network(
     neighbors: Option<HashSet<String>>,
     group_id: String,
     peer_endpoints: Option<HashMap<String, String>>,
+    multicast_interface: Option<Ipv4Addr>,
     config: NetworkConfig,
     mut stop_rx: oneshot::Receiver<()>,
     mut command_rx: async_mpsc::UnboundedReceiver<Command>,
@@ -992,13 +990,13 @@ async fn run_network(
             return;
         }
     };
-    // Use mDNS only for fixed-topology networks without static endpoints.
+    // Use UDP scouting only for fixed-topology networks without static endpoints.
     // Explicit peer endpoints keep the fixed topology but skip multicast discovery.
     let mut discovery = if neighbors.is_some() && peer_endpoints.is_none() {
-        match Discovery::new(&node_id, actual_port, &group_id) {
+        match Discovery::new(&node_id, actual_port, &group_id, multicast_interface) {
             Ok(discovery) => Some(discovery),
             Err(err) => {
-                let _ = ready_tx.send(Err(format!("Cannot start mDNS: {err}")));
+                let _ = ready_tx.send(Err(format!("Cannot start UDP scouting: {err}")));
                 return;
             }
         }
@@ -1018,20 +1016,12 @@ async fn run_network(
     let mut next_session = 0u64;
     let mut connecting = HashSet::<String>::new();
     let mut connected_before = HashSet::<PeerIndex>::new();
-    // Static endpoints are known from startup, so the existing retry and replay paths work without mDNS.
+    // Static endpoints use the same retry and replay mechanisms.
     // Only the smaller node ID initiates connections.
-    let mut addresses: HashMap<String, PeerAddress> = peer_endpoints
+    let mut addresses: HashMap<String, Vec<String>> = peer_endpoints
         .unwrap_or_default()
         .into_iter()
-        .map(|(peer_id, address)| {
-            (
-                peer_id,
-                PeerAddress {
-                    addresses: vec![address],
-                    fullname: None,
-                },
-            )
-        })
+        .map(|(peer_id, address)| (peer_id, vec![address]))
         .collect();
     let mut retry = interval(CONNECT_RETRY_INTERVAL);
     retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1102,10 +1092,7 @@ async fn run_network(
                         } else if peers.contains_id(&peer_id) || !connecting.insert(peer_id.clone()) {
                             let _ = reply.send(Err(format!("Already connected or connecting to {peer_id}")));
                         } else {
-                            addresses.insert(peer_id.clone(), PeerAddress {
-                                addresses: vec![address.clone()],
-                                fullname: None,
-                            });
+                            addresses.insert(peer_id.clone(), vec![address.clone()]);
                             start_connect(&node_id, peer_id, vec![address], established_tx.clone(), Some(reply));
                         }
                     }
@@ -1258,59 +1245,60 @@ async fn run_network(
                 }
             }
 
-            // mDNS only tells us where a node is; it never changes our topology.
-            discovered_event = async {
+            // Discovery provides peer addresses without changing the topology.
+            discovered_peer = async {
                 match discovery.as_mut() {
                     Some(discovery) => discovery.next().await,
-                    None => future::pending::<Option<DiscoveryEvent>>().await,
+                    None => future::pending().await,
                 }
             } => {
-                match discovered_event {
-                    Some(DiscoveryEvent::Found(peer)) => {
+                match discovered_peer {
+                    Some(peer) => {
                         let peer_id = peer.node_id;
+
                         if neighbors.as_ref().is_some_and(|ids| ids.contains(&peer_id)) {
-                            let candidates = peer.addresses.into_iter()
+                            let candidates = peer.addresses
+                                .into_iter()
                                 .map(|addr| addr.to_string())
                                 .collect::<Vec<_>>();
-                            addresses.insert(peer_id.clone(), PeerAddress {
-                                addresses: candidates.clone(),
-                                fullname: Some(peer.fullname),
-                            });
+
+                            addresses.insert(peer_id.clone(), candidates.clone());
+
                             if node_id.as_str() < peer_id.as_str()
                                 && !peers.contains_id(&peer_id)
                                 && connecting.insert(peer_id.clone())
                             {
-                                start_connect(&node_id, peer_id, candidates, established_tx.clone(), None);
+                                start_connect(
+                                    &node_id,
+                                    peer_id,
+                                    candidates,
+                                    established_tx.clone(),
+                                    None,
+                                );
                             }
                         }
                     }
-                    Some(DiscoveryEvent::Removed { node_id, fullname }) => {
-                        // An old service removal must not erase a newly discovered address.
-                        // Keep any established TCP connection even when its service disappears.
-                        if addresses.get(&node_id)
-                            .is_some_and(|entry| entry.fullname.as_deref() == Some(fullname.as_str()))
-                        {
-                            addresses.remove(&node_id);
-                        }
-                    }
+
                     None => {
-                        warn!("[{node_id}] mDNS discovery stopped");
-                        discovery = None; // avoid a busy loop on a closed receiver
+                        warn!("[{node_id}] UDP scouting stopped");
+                        discovery = None;
                     }
                 }
             }
 
-            // If a service was discovered before its TCP listener was ready,
-            // retry connection without waiting for another mDNS notification.
+            // Retry disconnected peers using their last discovered TCP addresses.
             _ = retry.tick(), if !addresses.is_empty() => {
-                for (peer_id, entry) in &addresses {
+                for (peer_id, candidates) in &addresses {
                     if node_id.as_str() < peer_id.as_str()
                         && !peers.contains_id(peer_id)
                         && connecting.insert(peer_id.clone())
                     {
                         start_connect(
-                            &node_id, peer_id.clone(), entry.addresses.clone(),
-                            established_tx.clone(), None,
+                            &node_id,
+                            peer_id.clone(),
+                            candidates.clone(),
+                            established_tx.clone(),
+                            None,
                         );
                     }
                 }
@@ -1382,11 +1370,7 @@ async fn run_network(
         peer.reader.abort();
         peer.writer.abort();
     }
-    if let Some(discovery) = discovery {
-        if let Err(err) = discovery.close() {
-            warn!("[{node_id}] Failed to stop mDNS: {err}");
-        }
-    }
+
     info!("[{node_id}] Stopped");
 }
 
@@ -1403,6 +1387,7 @@ pub struct CoreNetwork {
     neighbors: Option<HashSet<String>>,
     group_id: String,
     peer_endpoints: Option<HashMap<String, String>>,
+    multicast_interface: Option<Ipv4Addr>,
     config: NetworkConfig,
     exchange_session: Mutex<ExchangeSession>,
     commands: Option<async_mpsc::UnboundedSender<Command>>,
@@ -1532,9 +1517,11 @@ impl CoreNetwork {
     #[pyo3(signature = (
         node_id,
         port=0,
+        *,
         neighbors=None,
         group_id="default",
         peer_endpoints=None,
+        multicast_interface=None,
         max_message_size=DEFAULT_MAX_MESSAGE_SIZE,
         max_unacked_bytes=DEFAULT_MAX_UNACKED_BYTES,
         max_early_bytes=DEFAULT_MAX_EARLY_BYTES,
@@ -1545,6 +1532,7 @@ impl CoreNetwork {
         neighbors: Option<Vec<String>>,
         group_id: &str,
         peer_endpoints: Option<HashMap<String, String>>,
+        multicast_interface: Option<String>,
         max_message_size: usize,
         max_unacked_bytes: usize,
         max_early_bytes: usize,
@@ -1586,6 +1574,14 @@ impl CoreNetwork {
             }
         }
 
+        let multicast_interface = multicast_interface
+            .map(|ip| {
+                ip.parse::<Ipv4Addr>().map_err(|_| {
+                    PyValueError::new_err("multicast_interface must be a valid IPv4 address")
+                })
+            })
+            .transpose()?;
+
         let config = NetworkConfig {
             max_message_size,
             max_unacked_bytes,
@@ -1599,6 +1595,7 @@ impl CoreNetwork {
             neighbors,
             group_id: group_id.to_owned(),
             peer_endpoints,
+            multicast_interface,
             config,
             exchange_session: Mutex::new(ExchangeSession::default()),
             commands: None,
@@ -1622,6 +1619,7 @@ impl CoreNetwork {
         let neighbors = self.neighbors.clone();
         let group_id = self.group_id.clone();
         let peer_endpoints = self.peer_endpoints.clone();
+        let multicast_interface = self.multicast_interface;
         let config = self.config;
         let worker = thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1634,6 +1632,7 @@ impl CoreNetwork {
                     neighbors,
                     group_id,
                     peer_endpoints,
+                    multicast_interface,
                     config,
                     stop_rx,
                     command_rx,
@@ -1960,6 +1959,7 @@ mod ack_tests {
             None,
             "test",
             None,
+            None,
             DEFAULT_MAX_MESSAGE_SIZE,
             DEFAULT_MAX_UNACKED_BYTES,
             DEFAULT_MAX_EARLY_BYTES,
@@ -2261,6 +2261,7 @@ mod optimization_tests {
             Some(HashSet::from(["B".into()])),
             "test".into(),
             Some(HashMap::from([("B".into(), format!("127.0.0.1:{port_b}"))])),
+            None,
             config,
             stopped_a,
             recv_a,
@@ -2272,6 +2273,7 @@ mod optimization_tests {
             Some(HashSet::from(["A".into()])),
             "test".into(),
             Some(HashMap::from([("A".into(), format!("127.0.0.1:{port_a}"))])),
+            None,
             config,
             stopped_b,
             recv_b,
@@ -2375,6 +2377,7 @@ mod optimization_tests {
             Some(HashSet::from(["B".into()])),
             "early-test".into(),
             Some(HashMap::from([("B".into(), b_address)])),
+            None,
             config,
             stop_rx,
             command_rx,

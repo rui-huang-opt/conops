@@ -177,10 +177,11 @@ impl EarlyMessages {
     /// Non-destructive validation. This must precede any early-data removal.
     pub fn check_batch(&self, batch: &Batch) -> Result<(), &'static str> {
         for (peer, entry) in self.entries.iter().enumerate() {
-            if let Some(entry) = entry {
-                if &entry.key == batch.key() && !batch.expects(peer) {
-                    return Err("Unexpected peer in early message cache");
-                }
+            if let Some(entry) = entry
+                && entry.key == batch.key()
+                && !batch.expects(peer)
+            {
+                return Err("Unexpected peer in early message cache");
             }
         }
         Ok(())
