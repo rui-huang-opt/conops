@@ -1,5 +1,7 @@
 # ConOps (Consensus Operations)
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 **ConOps** is a Python package providing graph abstractions and synchronous neighbor-to-neighbor communication primitives for distributed consensus and optimization algorithms.
 
 It provides two communication implementations:
@@ -40,7 +42,7 @@ cd conops
 pip install -e .
 ```
 
-**Note:** Installing from source requires a Rust toolchain to compile the Rust extension. For an optimized local build during development, use `maturin develop --release` in an activated virtual environment.
+**Note:** Installing from source builds the Rust extension. Pip may automatically provision a Rust toolchain during installation, so Rust does not always need to be installed beforehand. For local development, `maturin develop --release` requires Maturin and a working Rust toolchain to be available in the current environment.
 
 ## Undirected Graphs
 
@@ -83,7 +85,7 @@ Each node needs only its own `node_id` and a dictionary mapping neighbor IDs to 
 
 The Rust-backed `Network` supports two connection modes:
 
-- **Automatic discovery (default):** mDNS discovers configured neighbors on a local network.
+- **Automatic discovery (default):** UDP scouting discovers configured neighbors through multicast SCOUT requests and unicast HELLO responses.
 
 - **Manual configuration:** `peer_endpoints` supplies TCP addresses directly, which is useful on servers and in Kubernetes environments where multicast discovery may not be available.
 
@@ -101,6 +103,20 @@ network = Network(
 network.start()
 network.wait_connected(timeout=30)
 ```
+
+### Selecting a Multicast Interface
+
+On machines with multiple network interfaces, specify the local IPv4 address of the interface used for UDP multicast scouting:
+
+```python
+network = Network(
+    node_id="1",
+    neighbors={"2": 0.45, "5": 0.45},
+    multicast_interface="10.42.0.1",
+)
+```
+
+Use the IPv4 address assigned to this node's interface, not an interface name such as `wlan1`. When omitted, the operating system selects the multicast interface. This option affects UDP multicast discovery, not the TCP listening interface, and is ignored when `peer_endpoints` is provided.
 
 Once connected, the node can exchange NumPy arrays and apply operators such as `laplacian()` and `weighted_mix()`.
 
