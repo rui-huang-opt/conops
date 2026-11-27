@@ -1,7 +1,9 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_int, c_void},
-    future, io, ptr,
+    future, io,
+    net::Ipv4Addr,
+    ptr,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
@@ -963,6 +965,7 @@ async fn run_network(
     neighbors: Option<HashSet<String>>,
     group_id: String,
     peer_endpoints: Option<HashMap<String, String>>,
+    multicast_interface: Option<Ipv4Addr>,
     config: NetworkConfig,
     mut stop_rx: oneshot::Receiver<()>,
     mut command_rx: async_mpsc::UnboundedReceiver<Command>,
@@ -990,7 +993,7 @@ async fn run_network(
     // Use UDP scouting only for fixed-topology networks without static endpoints.
     // Explicit peer endpoints keep the fixed topology but skip multicast discovery.
     let mut discovery = if neighbors.is_some() && peer_endpoints.is_none() {
-        match Discovery::new(&node_id, actual_port, &group_id) {
+        match Discovery::new(&node_id, actual_port, &group_id, multicast_interface) {
             Ok(discovery) => Some(discovery),
             Err(err) => {
                 let _ = ready_tx.send(Err(format!("Cannot start UDP scouting: {err}")));
@@ -1384,6 +1387,7 @@ pub struct CoreNetwork {
     neighbors: Option<HashSet<String>>,
     group_id: String,
     peer_endpoints: Option<HashMap<String, String>>,
+    multicast_interface: Option<Ipv4Addr>,
     config: NetworkConfig,
     exchange_session: Mutex<ExchangeSession>,
     commands: Option<async_mpsc::UnboundedSender<Command>>,
@@ -1513,9 +1517,11 @@ impl CoreNetwork {
     #[pyo3(signature = (
         node_id,
         port=0,
+        *,
         neighbors=None,
         group_id="default",
         peer_endpoints=None,
+        multicast_interface=None,
         max_message_size=DEFAULT_MAX_MESSAGE_SIZE,
         max_unacked_bytes=DEFAULT_MAX_UNACKED_BYTES,
         max_early_bytes=DEFAULT_MAX_EARLY_BYTES,
@@ -1526,6 +1532,7 @@ impl CoreNetwork {
         neighbors: Option<Vec<String>>,
         group_id: &str,
         peer_endpoints: Option<HashMap<String, String>>,
+        multicast_interface: Option<String>,
         max_message_size: usize,
         max_unacked_bytes: usize,
         max_early_bytes: usize,
@@ -1567,6 +1574,14 @@ impl CoreNetwork {
             }
         }
 
+        let multicast_interface = multicast_interface
+            .map(|ip| {
+                ip.parse::<Ipv4Addr>().map_err(|_| {
+                    PyValueError::new_err("multicast_interface must be a valid IPv4 address")
+                })
+            })
+            .transpose()?;
+
         let config = NetworkConfig {
             max_message_size,
             max_unacked_bytes,
@@ -1580,6 +1595,7 @@ impl CoreNetwork {
             neighbors,
             group_id: group_id.to_owned(),
             peer_endpoints,
+            multicast_interface,
             config,
             exchange_session: Mutex::new(ExchangeSession::default()),
             commands: None,
@@ -1603,6 +1619,7 @@ impl CoreNetwork {
         let neighbors = self.neighbors.clone();
         let group_id = self.group_id.clone();
         let peer_endpoints = self.peer_endpoints.clone();
+        let multicast_interface = self.multicast_interface;
         let config = self.config;
         let worker = thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -1615,6 +1632,7 @@ impl CoreNetwork {
                     neighbors,
                     group_id,
                     peer_endpoints,
+                    multicast_interface,
                     config,
                     stop_rx,
                     command_rx,
@@ -1941,6 +1959,7 @@ mod ack_tests {
             None,
             "test",
             None,
+            None,
             DEFAULT_MAX_MESSAGE_SIZE,
             DEFAULT_MAX_UNACKED_BYTES,
             DEFAULT_MAX_EARLY_BYTES,
@@ -2242,6 +2261,7 @@ mod optimization_tests {
             Some(HashSet::from(["B".into()])),
             "test".into(),
             Some(HashMap::from([("B".into(), format!("127.0.0.1:{port_b}"))])),
+            None,
             config,
             stopped_a,
             recv_a,
@@ -2253,6 +2273,7 @@ mod optimization_tests {
             Some(HashSet::from(["A".into()])),
             "test".into(),
             Some(HashMap::from([("A".into(), format!("127.0.0.1:{port_a}"))])),
+            None,
             config,
             stopped_b,
             recv_b,
@@ -2356,6 +2377,7 @@ mod optimization_tests {
             Some(HashSet::from(["B".into()])),
             "early-test".into(),
             Some(HashMap::from([("B".into(), b_address)])),
+            None,
             config,
             stop_rx,
             command_rx,

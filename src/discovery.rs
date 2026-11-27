@@ -17,9 +17,14 @@ const MULTICAST_PORT: u16 = 47222;
 const SCOUT_INTERVAL: Duration = Duration::from_secs(2);
 const MAGIC: &[u8] = b"CNOP";
 const VERSION: u8 = 1;
-const SCOUT: u8 = 1;
-const HELLO: u8 = 2;
 const HEADER_LEN: usize = 18;
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageKind {
+    Scout = 1,
+    Hello = 2,
+}
 
 #[derive(Debug)]
 pub struct DiscoveredPeer {
@@ -28,7 +33,7 @@ pub struct DiscoveredPeer {
 }
 
 struct Message<'a> {
-    kind: u8,
+    kind: MessageKind,
     group_id: &'a str,
     node_id: &'a str,
     tcp_port: u16,
@@ -46,7 +51,7 @@ fn encode_message(message: &Message<'_>) -> io::Result<Vec<u8>> {
     let mut packet =
         Vec::with_capacity(HEADER_LEN + usize::from(group_len) + usize::from(node_len));
     packet.extend_from_slice(MAGIC);
-    packet.extend_from_slice(&[VERSION, message.kind, group_len, node_len]);
+    packet.extend_from_slice(&[VERSION, message.kind as u8, group_len, node_len]);
     packet.extend_from_slice(&message.tcp_port.to_be_bytes());
     packet.extend_from_slice(&message.instance_id.to_be_bytes());
     packet.extend_from_slice(message.group_id.as_bytes());
@@ -59,10 +64,11 @@ fn decode_message(data: &[u8]) -> Option<Message<'_>> {
         return None;
     }
 
-    let kind = data[5];
-    if kind != SCOUT && kind != HELLO {
-        return None;
-    }
+    let kind = match data[5] {
+        1 => MessageKind::Scout,
+        2 => MessageKind::Hello,
+        _ => return None,
+    };
 
     let group_len = usize::from(data[6]);
     let node_len = usize::from(data[7]);
@@ -71,7 +77,7 @@ fn decode_message(data: &[u8]) -> Option<Message<'_>> {
     }
 
     let tcp_port = u16::from_be_bytes(data[8..10].try_into().ok()?);
-    if kind == HELLO && tcp_port == 0 {
+    if kind == MessageKind::Hello && tcp_port == 0 {
         return None;
     }
 
@@ -104,7 +110,12 @@ pub struct Discovery {
 impl Discovery {
     /// Publish this node's TCP address via HELLO and discover peers by SCOUT.
     /// Must be called inside a Tokio runtime (UdpSocket::from_std requirement).
-    pub fn new(node_id: &str, port: u16, group_id: &str) -> io::Result<Self> {
+    pub fn new(
+        node_id: &str,
+        port: u16,
+        group_id: &str,
+        interface: Option<Ipv4Addr>,
+    ) -> io::Result<Self> {
         if node_id.is_empty() || group_id.is_empty() || port == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -116,16 +127,22 @@ impl Discovery {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_reuse_address(true)?;
         socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MULTICAST_PORT).into())?;
-        socket.join_multicast_v4(&MULTICAST_IP, &Ipv4Addr::UNSPECIFIED)?;
+        socket.join_multicast_v4(&MULTICAST_IP, &interface.unwrap_or(Ipv4Addr::UNSPECIFIED))?;
         socket.set_nonblocking(true)?;
         let multicast = UdpSocket::from_std(socket.into())?;
 
         // Reply to the unique source port of each SCOUT, not the shared port.
-        let unicast = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-        unicast.set_nonblocking(true)?;
-        let unicast = UdpSocket::from_std(unicast)?;
-        unicast.set_multicast_loop_v4(true)?; // discover other nodes on this host
-        unicast.set_multicast_ttl_v4(1)?; // local subnet only
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())?;
+
+        if let Some(ip) = interface {
+            socket.set_multicast_if_v4(&ip)?;
+        }
+
+        socket.set_nonblocking(true)?;
+        let unicast = UdpSocket::from_std(socket.into())?;
+        unicast.set_multicast_loop_v4(true)?;
+        unicast.set_multicast_ttl_v4(1)?;
 
         // Distinguish a restarted process with the same logical node ID.
         let nanos = SystemTime::now()
@@ -135,14 +152,14 @@ impl Discovery {
         let instance_id = nanos ^ (u64::from(std::process::id()) << 32);
 
         let scout_packet = encode_message(&Message {
-            kind: SCOUT,
+            kind: MessageKind::Scout,
             group_id,
             node_id,
             tcp_port: 0,
             instance_id,
         })?;
         let hello_packet = encode_message(&Message {
-            kind: HELLO,
+            kind: MessageKind::Hello,
             group_id,
             node_id,
             tcp_port: port,
@@ -189,7 +206,7 @@ impl Discovery {
                     let Some(message) = decode_message(&multicast_buf[..len]) else {
                         continue;
                     };
-                    if message.kind != SCOUT
+                    if message.kind != MessageKind::Scout
                         || message.group_id != self.group_id.as_str()
                         || message.node_id == self.node_id.as_str()
                     {
@@ -211,7 +228,7 @@ impl Discovery {
                     let Some(message) = decode_message(&unicast_buf[..len]) else {
                         continue;
                     };
-                    if message.kind != HELLO
+                    if message.kind != MessageKind::Hello
                         || message.group_id != self.group_id.as_str()
                         || message.node_id == self.node_id.as_str()
                     {
@@ -243,7 +260,7 @@ mod tests {
     #[test]
     fn test_packet_codec() {
         let packet = encode_message(&Message {
-            kind: HELLO,
+            kind: MessageKind::Hello,
             group_id: "demo/group",
             node_id: "node-2",
             tcp_port: 5001,
@@ -252,7 +269,7 @@ mod tests {
         .unwrap();
 
         let message = decode_message(&packet).unwrap();
-        assert_eq!(message.kind, HELLO);
+        assert_eq!(message.kind, MessageKind::Hello);
         assert_eq!(message.group_id, "demo/group");
         assert_eq!(message.node_id, "node-2");
         assert_eq!(message.tcp_port, 5001);
@@ -269,8 +286,8 @@ mod tests {
         let b_id = format!("test-b-{pid}");
         let namespace = format!("test-namespace-{pid}");
 
-        let mut a = Discovery::new(&a_id, 5000, &namespace).unwrap();
-        let mut b = Discovery::new(&b_id, 5001, &namespace).unwrap();
+        let mut a = Discovery::new(&a_id, 5000, &namespace, None).unwrap();
+        let mut b = Discovery::new(&b_id, 5001, &namespace, None).unwrap();
 
         let (found_b, found_a) = timeout(Duration::from_secs(15), async {
             let mut found_b = None;
